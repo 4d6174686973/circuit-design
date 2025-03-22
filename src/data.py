@@ -8,7 +8,7 @@ from typing import Union
 from src.utils import real_to_binary, array_to_str
 
 # Global variables
-jgb_data_path = "/workspaces/circuit-design-feature-similarity/data/jgbcme_all.csv"  # publicly accessible on website of ministry of finance Japan, see readme
+jgb_data_path = "/workspaces/circuit-design/data/jgbcme_all.csv"  # publicly accessible on website of ministry of finance Japan, see readme
 init_qubit_order_bas = {
     "3x3" : [0, 1, 2, 5, 4, 3, 6 ,7, 8]
 }
