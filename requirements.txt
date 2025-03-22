@@ -1,0 +1,30 @@
+# standard packages
+pandas
+numpy
+ipykernel
+pytest      # for test cases
+pytest-cov  # for coverage
+scikit-learn
+statsmodels
+
+# small utils
+pickleshare  # to change workspace in notebooks
+pyarrow  # for parquet files
+fastparquet  # for parquet files
+hydra-core  # for config files
+networkx # for plotting graphs
+
+# quantum packages
+qiskit == 1.2.4  # need version 1.2.4 for using transpiler service
+qiskit_ibm_runtime
+qiskit-aer
+qiskit_transpiler_service
+
+# visualization
+matplotlib
+seaborn
+pylatexenc  # for latex in matplotlib
+SciencePlots # https://github.com/garrettj403/SciencePlots
+
+# mps decomp
+git+https://github.com/PGelss/scikit_tt

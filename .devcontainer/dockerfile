@@ -1,0 +1,17 @@
+FROM python:3.11.4-slim-bullseye
+
+RUN pip install --upgrade pip
+
+RUN apt-get update && apt-get install --no-install-recommends  -y \
+    git \
+    openssh-client \
+    htop \
+    && rm -rf /var/lib/apt/lists/*
+    
+
+COPY requirements.txt requirements.txt
+RUN pip install -r requirements.txt
+
+RUN useradd -ms /bin/bash vscode
+USER vscode
+WORKDIR /workspace

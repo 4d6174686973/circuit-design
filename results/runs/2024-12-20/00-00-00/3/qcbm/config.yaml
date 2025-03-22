@@ -1,0 +1,25 @@
+backend: statevector
+real_device: false
+instance: utokyo-kawasaki
+transpiler: service
+optimization_level: 3
+ai_transpiler: true
+N_qubits: 9
+N_shots: 1000
+circuit: mps
+N_layers: 4
+extension: all-to-all
+mps_run: 2024-12-19/1
+N_epochs: 1000
+train_func: SGD
+loss: MMD
+batch_size: 0
+sigmas:
+- 1.0
+init_learning_rate: 0.01
+finite_diff_epsilon: 1.0e-08
+dataset: BAS
+train_split: 0.8
+width: 3
+height: 3
+N_features: 2
