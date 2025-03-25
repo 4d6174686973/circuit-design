@@ -1,8 +1,9 @@
-# Circuit Design based on Dataset Topology for Quantum Generative Modeling
+# Circuit Design based on Feature Similarity for Quantum Generative Modeling
+This repository includes the source code for simulations carried out in Ref. [[1](#reference)].
 
 ## First setup
 
-Install dependencies or open in devcontainer
+Install dependencies or open in devcontainer to automatically set up the envorinment.
 
 ```sh
 pip install -r requirements.txt
@@ -54,4 +55,4 @@ pytest --cov=src
 
 ## Reference
 
-Mathis Makarski, Jumpei Kato, Yuki Sato, Naoki Yamamoto, [Circuit Design based on Feature Similarity for Quantum Generative Modeling](https://doi.org/10.48550/arXiv.2503.11983), arXiv preprint (2025)
+[1] Mathis Makarski, Jumpei Kato, Yuki Sato, Naoki Yamamoto, [Circuit Design based on Feature Similarity for Quantum Generative Modeling](https://doi.org/10.48550/arXiv.2503.11983), arXiv preprint (2025)
