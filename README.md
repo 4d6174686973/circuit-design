@@ -3,8 +3,17 @@ This repository includes the source code for simulations carried out in Ref. [[1
 
 ## First setup
 
-Install dependencies or open in devcontainer to automatically set up the envorinment.
+Setup virtual environment
+```sh
+python3 -m venv .venv
+```
 
+Activate virtual environment
+```sh
+source venv/bin/activate
+```
+
+Install dependencies
 ```sh
 pip install -r requirements.txt
 ```
