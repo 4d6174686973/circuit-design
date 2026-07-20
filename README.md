@@ -21,14 +21,17 @@ Download JGB dataset from: [https://www.mof.go.jp/english/policy/jgbs/reference/
     - `plot_figures.ipynb` plot the figures for the paper 
 - `src/` code for running simulations
     - `src/conf/config.yaml` configuration for the simulation
+    - `benchmark.py` held-out generative-model metrics, classical baselines, best-model selection
     - `cost.py` loss functions, gradients, and meta-optimizer
     - `data.py` dataclasses and dataloader
     - `decomposition.py` decompose MPS to PQC by Yuki Sato [@yksat](https://github.com/yksat)
     - `extension.py` functions for extending the decomposed circuit
     - `mps.py` train MPS by [@congzlwag](https://github.com/congzlwag)
+    - `plotting.py` wandb-driven figure generation for a sweep (replaces `results v1/plot_figures.ipynb`)
     - `qcbm.py` train QCBM using qiskit
-    - `setup.py` setup the whole simulation from config including pretraining
+    - `setup.py` setup the whole simulation from config including pretraining, wandb, and sweep creation
     - `utils.py` general utility functions and plotting
+- `scripts/sweep.sh` SLURM-submittable launcher for cluster/multi-node sweeps (see below)
 
 ## Singlerun
 Running a single simulation based on current config file `src/conf/config.yaml`
@@ -54,6 +57,39 @@ uv run python -m src --multirun extension=none,metric_based,all_to_all \
     runs_batch_size=5 initial_random_seed=42
 ```
 This runs 3 extensions x 5 seeds (42-46) = 15 trainings, 5 running in parallel at a time.
+
+## Experiment tracking (wandb)
+
+Every invocation above — a single run, a local `--multirun`, or a `scripts/sweep.sh` cluster launch
+— is automatically registered as a real **wandb Sweep** (visible under the Sweeps tab, with
+parallel-coordinates plots etc.), no extra flags needed. The Hydra grid (and `runs_batch_size`'s
+auto-seeded repeats) is what actually determines what gets run — wandb is not used to choose
+hyperparameters (no `wandb agent`), only to track and organize the resulting runs. Each run's
+`group` is its swept-parameter combination (e.g. `extension=metric_based`); seeds within a group are
+its repeats.
+
+By default `wandb_mode: online` in `src/conf/config.yaml`, so **run `wandb login` once** before your
+first sweep (or pass `wandb_mode=offline` to log locally and `wandb sync` later, or
+`wandb_mode=disabled` to skip wandb entirely, e.g. for quick local testing):
+```sh
+uv run python -m src --multirun extension=none,metric_based,all_to_all wandb_mode=offline
+```
+Project/entity are set via `wandb_project` / `wandb_entity` in the config (or as CLI overrides).
+
+For a cluster/SLURM launch (multi-node, proper resource requests, automatic disjoint seed-sharding
+across nodes, and leader/worker synchronization so every node's runs join the *same* sweep), use
+`scripts/sweep.sh` instead of invoking `python -m src` directly — see the comments at the top of
+that file for `sbatch`/multi-node usage.
+
+Once a sweep has runs, regenerate all figures (including the paper's dataset/topology plots, MMD
+over cumulative measurements, and best-model QQ/benchmark plots) as PDF:
+```python
+from src.plotting import generate_all_figures
+generate_all_figures(sweep_id="<sweep_id>", entity="<entity>", project="qcbm-circuit-design",
+                     dataset_cfg={"dataset": "BAS", "width": 3, "height": 3, "N_qubits": 9})
+```
+The `sweep_id` is printed in every run's log line (`Program started (..., sweep_id=...)`), or find it
+under the wandb project's Sweeps tab.
 
 ## Testing and code coverage
 ```sh

@@ -303,12 +303,18 @@ def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
     automatically to join the same real wandb Sweep, with no need for `wandb.agent()`.
 
     Idempotent via the env var: if WANDB_SWEEP_ID is already set — because a previous Hydra job in
-    this same multirun process already created it, or because it was exported manually for a
-    multi-node launch (see scripts/sweep.sh) — it's reused as-is and no new sweep is created.
+    this same multirun process already created it, or because it was exported by a shell launcher
+    (see scripts/sweep.sh) — it's reused as-is and no new sweep is created.
 
     Only real wandb.sweep() calls happen when wandb_mode == "online" (it requires the backend);
     for offline/disabled runs a local synthetic id is used instead so local/test runs need no
     network access.
+
+    If WANDB_SWEEP_ID_FILE is set (used by scripts/sweep.sh for multi-node SLURM array launches,
+    where separate nodes are separate processes with no shared env to inherit from), the freshly
+    created id is also written to that path on a shared filesystem, so other nodes can poll for it
+    and export it themselves instead of each independently creating (and colliding on) their own
+    sweep. Only written on actual creation, never on the early-return reuse path above.
     """
     if os.environ.get("WANDB_SWEEP_ID"):
         return os.environ["WANDB_SWEEP_ID"]
@@ -322,15 +328,27 @@ def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
         sweep_id = f"local_{datetime.now():%Y%m%d_%H%M%S}_{socket.gethostname()}"
 
     os.environ["WANDB_SWEEP_ID"] = sweep_id
+
+    sweep_id_file = os.environ.get("WANDB_SWEEP_ID_FILE")
+    if sweep_id_file:
+        with open(sweep_id_file, "w") as f:
+            f.write(sweep_id)
+
     return sweep_id
 
 
-def _init_wandb(cfg: DictConfig, group: str):
+def _init_wandb(cfg: DictConfig, group: str, sweep_id: str):
     """Initialize a wandb run for one seed; returns the run (or None if disabled).
 
-    Joining the sweep created by get_or_create_wandb_sweep happens automatically: wandb.init()
-    reads the WANDB_SWEEP_ID environment variable (already set before this is called) and attaches
-    the run server-side — no sweep_id kwarg or tag needed here.
+    Joining the sweep is done via an EXPLICIT `settings=wandb.Settings(sweep_id=...)` override,
+    not by relying on wandb.init() picking up the WANDB_SWEEP_ID env var on its own. That env-var
+    path is unreliable here: wandb.sweep() (in get_or_create_wandb_sweep) triggers a login call
+    that snapshots os.environ into a process-wide Settings singleton BEFORE we set WANDB_SWEEP_ID,
+    so every later wandb.init() in that process (e.g. every sequential Hydra job when
+    runs_batch_size==1, since BasicLauncher reuses one process) would silently reuse that
+    stale, sweep-less snapshot instead of re-reading the env var — this is exactly what produced
+    runs that were created but not attached to the sweep. Passing sweep_id explicitly here is a
+    per-call override applied on top of that singleton, so it's correct regardless of caching.
     """
     import wandb
     entity = cfg["wandb_entity"]
@@ -343,6 +361,7 @@ def _init_wandb(cfg: DictConfig, group: str):
         job_type="train",
         config=OmegaConf.to_container(cfg, resolve=True),
         mode=cfg["wandb_mode"],
+        settings=wandb.Settings(sweep_id=sweep_id),
         reinit=True,
     )
 
@@ -425,7 +444,7 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
     sweep_id = get_or_create_wandb_sweep(cfg)
     logger.info(f"Program started (seed={cfg['random_seed']}, group={group}, sweep_id={sweep_id})")
 
-    run = _init_wandb(cfg, group)
+    run = _init_wandb(cfg, group, sweep_id)
 
     try:
         # Setup dataloader and 3-way split (computed once, reused for MPS + QCBM)
