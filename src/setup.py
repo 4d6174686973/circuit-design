@@ -484,7 +484,13 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
         # Save model + checkpoint
         qcbm.save(save_dir)
 
-        # Upload artifact and record best-model summary for the selection step
+        # Upload artifact and record best-model summary for the selection step.
+        # Only circuit.qpy + best_params.npy are uploaded: they're the sole files needed to
+        # reconstruct/sample the best checkpoint (src/benchmark.py::load_checkpoint) and aren't
+        # representable as wandb scalar metrics. Everything else `qcbm.save()` writes locally
+        # (losses.parquet, checkpoint_meta.json, full params.npy history) duplicates data already
+        # logged as wandb metrics/summary/config (mmd_train/val/test, best_mmd_val, best_iter,
+        # total_measurements, num_parameters, ...) and is not re-uploaded.
         if run is not None:
             import wandb
             run.summary["best_mmd_val"] = qcbm.best_metric
@@ -492,7 +498,8 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
             run.summary["total_measurements"] = qcbm.total_measurements
             artifact = wandb.Artifact(f"qcbm_{run.id}", type="model",
                                       metadata={"seed": cfg["random_seed"], "group": group})
-            artifact.add_dir(save_dir)
+            artifact.add_file(f"{save_dir}/circuit.qpy")
+            artifact.add_file(f"{save_dir}/best_params.npy")
             run.log_artifact(artifact, aliases=[f"seed{cfg['random_seed']}"])
 
         logger.info("Program finished")
