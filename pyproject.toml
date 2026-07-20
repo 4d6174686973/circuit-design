@@ -9,6 +9,7 @@ dependencies = [
     # standard packages
     "pandas",
     "numpy",
+    "scipy",         # cdist kernel, stats/Wasserstein in benchmarking
     "scikit-learn",
     "statsmodels",
 
@@ -18,6 +19,9 @@ dependencies = [
     "fastparquet",   # for parquet files
     "hydra-core",    # for config files
     "networkx",      # for plotting graphs
+
+    # experiment tracking
+    "wandb",         # online logging of sweeps
 
     # quantum packages
     "qiskit==1.2.4", # need version 1.2.4 for using transpiler service

@@ -42,11 +42,18 @@ Running multiple simulations sequentially based on same config file but changing
 ```sh
 uv run python -m src --multirun extension=none,metric_based,all_to_all
 ```
-Important for running simulations with random extension is changing the random_seed, which is somehow fixed when using multirun from hydra
-```sh
-uv run python -m src --multirun random_seed=42,43,44,45,46
-```
 Results will be saved in `multirun/`
+
+## Parallel seeds (batching)
+For each hyperparameter combination (e.g. each `extension` above), you can run several repeats with
+different random seeds in parallel. You only ever set `initial_random_seed`; the `runs_batch_size`
+parallel repeats are auto-seeded as `initial_random_seed + i` and logged individually — there is no
+separate seed parameter to set per run, so runs can't accidentally collide on the same seed.
+```sh
+uv run python -m src --multirun extension=none,metric_based,all_to_all \
+    runs_batch_size=5 initial_random_seed=42
+```
+This runs 3 extensions x 5 seeds (42-46) = 15 trainings, 5 running in parallel at a time.
 
 ## Testing and code coverage
 ```sh

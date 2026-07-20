@@ -13,8 +13,9 @@ def test_linear_topology():
         "SR_12Q" : [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10), (10, 11)],
     }
 
-    assert linear_topology(init_topologies["BAS_3x3"]) == list(set([tuple(sorted(c)) for c in correct_topologies["BAS_3x3"]]))
-    assert linear_topology(init_topologies["SR_12Q"]) == list(set([tuple(sorted(c)) for c in correct_topologies["SR_12Q"]]))
+    # linear_topology returns a sorted, de-duplicated list, so compare against the sorted set
+    assert linear_topology(init_topologies["BAS_3x3"]) == sorted(set([tuple(sorted(c)) for c in correct_topologies["BAS_3x3"]]))
+    assert linear_topology(init_topologies["SR_12Q"]) == sorted(set([tuple(sorted(c)) for c in correct_topologies["SR_12Q"]]))
 
 
 def test_nearest_neighbor_topology():
@@ -24,7 +25,7 @@ def test_nearest_neighbor_topology():
     nn_connections = nearest_neighbor_topology(3, 3)
     extension = set(nn_connections) - set(linear_connections)  # remove linear connections
 
-    assert list(set([tuple(sorted(c)) for c in extension])) == list(set([tuple(sorted(c)) for c in correct_extension]))
+    assert sorted(set([tuple(sorted(c)) for c in extension])) == sorted(set([tuple(sorted(c)) for c in correct_extension]))
 
 
 def test_random_topology():

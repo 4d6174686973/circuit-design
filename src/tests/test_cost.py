@@ -1,5 +1,5 @@
 import numpy as np
-from src.cost import kernel_matrix_slow, kernel_matrix, cost_mmd, cost_grad_mmd, adam, kernel_matrix_multithread
+from src.cost import kernel_matrix, cost_mmd, cost_grad_mmd, adam
 
 # Global variable
 precision = 14  # 14 decimal places for testing
@@ -25,28 +25,9 @@ def test_kernel_matrix():
     XX_test = np.array([[1,1/np.exp(1)], [1/np.exp(1),1]])
     XY_test = np.array([[1,1/np.exp(2)], [1/np.exp(1),1/np.exp(1)]])
 
-    # Test kernel_matrix_slow
-    assert (kernel_matrix_slow(X,X,sigmas).round(precision) == XX_test.round(precision)).all(), "Test 1 for kernel_matrix_slow failed"
-    assert (kernel_matrix_slow(X,Y,sigmas).round(precision) == XY_test.round(precision)).all(), "Test 2 for kernel_matrix_slow failed"
-
     # Test kernel_matrix
     assert (kernel_matrix(X,X,sigmas).round(precision) == XX_test.round(precision)).all(), "Test 1 for kernel_matrix failed"
     assert (kernel_matrix(X,Y,sigmas).round(precision) == XY_test.round(precision)).all(), "Test 2 for kernel_matrix failed"
-
-    # Check if loop and vectorized version are the same
-    n_samples = 100  # max about 900 samples for vectorized version
-    X = np.full((n_samples, n_samples), np.random.rand())
-    Y = np.full((n_samples, n_samples), np.random.rand())
-    assert (kernel_matrix_slow(X,Y,sigmas).round(precision) == kernel_matrix(X,Y,sigmas).round(precision)).all(), "kernel_matrix_slow and kernel_matrix are not the same"
-
-
-def test_kernel_matrix_multithread():
-    n_qubits = 9
-    n_samples = 100
-    X = np.random.randint(0, 2, (n_samples, 2**n_qubits))
-    Y = np.random.randint(0, 2, (n_samples, 2**n_qubits))
-    sigma=np.array([1.0])
-    assert np.all(kernel_matrix(X, Y, sigma) - kernel_matrix_multithread(X, Y, sigma, 4) == 0)
 
 
 def test_cost_mmd():

@@ -166,3 +166,4 @@ outputs/
 plots/
 multirun/
 data/
+wandb/

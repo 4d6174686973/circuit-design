@@ -15,24 +15,39 @@ def array_to_str(binary_array: np.ndarray) -> list[str]:
         str_list.append("".join(str(int(j)) for j in binary_array[i]))
     return str_list
 
-def real_to_binary(data: np.ndarray, bits_per_feature: int):
-    '''Conversion of real-valued data set into binary features. Every real valued number is 
+def real_to_binary(data: np.ndarray, bits_per_feature: int, x_min=None, x_max=None, clip: bool = True):
+    '''Conversion of real-valued data set into binary features. Every real valued number is
     converted into a n-bit binary number.
-    
+
     Parameters
     -----------
     data: DataFrame
         The real-valued data set of shape (n_samples, n_features).
-    
+    bits_per_feature: int
+        Number of bits used to encode each feature.
+    x_min, x_max: array-like or None
+        Per-feature min/max used for the discretization. When None (default) they are fitted
+        from `data` (original behaviour). Pass train-fitted bounds to binarize validation/test
+        data without leaking their range into the encoding.
+    clip: bool
+        When True, clip the discretized integer into [0, 2**bits_per_feature - 1] so values that
+        fall outside the provided bounds map to the extreme bin instead of overflowing the bit
+        width (essential when reusing train bounds on unseen val/test data).
+
     Returns
     --------
     data_binary: DataFrame
         The binary data set fo shape (n_samples, bits_per_feature * n_features).'''
     data_binary = np.array([[0] * (bits_per_feature * data.shape[1]) for _ in range(data.shape[0])])
-    x_min, x_max = np.min(data, axis=0), np.max(data, axis=0)
+    if x_min is None or x_max is None:
+        x_min, x_max = np.min(data, axis=0), np.max(data, axis=0)
+    x_min, x_max = np.asarray(x_min, dtype=float), np.asarray(x_max, dtype=float)
+    max_int = 2**bits_per_feature - 1
     for n in range(data.shape[1]):
         for l in range(data.shape[0]):
-            x_integer = int((2**bits_per_feature - 1) * (data[l, n] - x_min[n]) / (x_max[n] - x_min[n]))
+            x_integer = int(max_int * (data[l, n] - x_min[n]) / (x_max[n] - x_min[n]))
+            if clip:
+                x_integer = min(max(x_integer, 0), max_int)
             binary_string = bin(x_integer)[2:].zfill(bits_per_feature)
             for bit_index, bit in enumerate(binary_string):
                 data_binary[l, n * bits_per_feature + bit_index] = int(bit)

@@ -1,20 +1,24 @@
 import pandas as pd
 import numpy as np
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import logging
 from scipy.spatial import distance
 import time
 import os
-import yaml
+import sys
+import socket
+import hashlib
+from datetime import datetime
 
 # qiskit stuff
 from qiskit import qpy
 from qiskit import QuantumCircuit
 from scikit_tt import TT
-from qiskit_ibm_runtime import SamplerV2, QiskitRuntimeService
+from qiskit_ibm_runtime import SamplerV2 as RuntimeSamplerV2, QiskitRuntimeService
 from qiskit_aer import AerSimulator
 from qiskit_transpiler_service.transpiler_service import TranspilerService
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+from hydra.utils import to_absolute_path
 
 # own modules
 from src.qcbm import QCBM
@@ -25,29 +29,47 @@ from src.utils import varInfoMat
 from src.decompositon import mps2circuit
 
 
-def setup_qiskit_simulator(simulator: str) -> tuple:
-    """Setup the Qiskit simulator.
-    Args:
-        simulator (str): The simulator to use "aer_statevec_cpu" or "aer_kawasaki"
-    Returns:
-        tuple: The sampler and backend
-    """
+def setup_qiskit_simulator(cfg: DictConfig) -> tuple:
+    """Setup the Qiskit runner + backend.
 
-    if simulator == "aer_statevec_cpu":
-        backend = AerSimulator(method="statevector")
-        sampler = SamplerV2(backend)
-    elif simulator == "aer_statevec_gpu":
-        backend = AerSimulator(method="statevector", device="GPU")
-        sampler = SamplerV2(backend)
+    For simulation this returns a configured ``AerSimulator`` used via
+    ``run(circuit, parameter_binds=[{param: values}])`` — Aer's native fast path that binds all
+    2P+1 parameterizations in one C++ call. Empirically this is ~9x faster than routing the same
+    options through ``qiskit_aer.primitives.SamplerV2`` (which rebinds/experiments per circuit).
+    The real-device (``aer_kawasaki``) path keeps ``qiskit_ibm_runtime.SamplerV2``.
+
+    Returns:
+        (runner, backend, use_parameter_binds)
+    """
+    simulator = cfg["simulator"]
+
+    if simulator in ("aer_statevec_cpu", "aer_statevec_gpu"):
+        device = "GPU" if simulator == "aer_statevec_gpu" else "CPU"
+        backend_options = {
+            "method": "statevector",
+            "device": device,
+            "runtime_parameter_bind_enable": True,
+            "max_parallel_experiments": cfg["aer_max_parallel_experiments"],
+            "max_parallel_shots": cfg["aer_max_parallel_shots"],
+            "seed_simulator": cfg["random_seed"],
+        }
+        if device == "GPU":
+            backend_options["batched_shots_gpu"] = True
+            backend_options["batched_shots_gpu_max_qubits"] = cfg["aer_batched_shots_gpu_max_qubits"]
+            if cfg["N_qubits"] >= cfg["aer_blocking_qubits_threshold"]:
+                backend_options["blocking_enable"] = True
+                backend_options["blocking_qubits"] = cfg["aer_blocking_qubits"]
+        backend = AerSimulator(**backend_options)
+        return backend, backend, True
+
     elif simulator == "aer_kawasaki":
         service = setup_ibm_service()
-        backend = service.backend("ibm_kawasaki")
-        backend_sim = AerSimulator.from_backend(backend)
-        sampler = SamplerV2(backend_sim)
+        device_backend = service.backend("ibm_kawasaki")
+        backend = AerSimulator.from_backend(device_backend)
+        sampler = RuntimeSamplerV2(backend)
+        return sampler, backend, False
     else:
         raise ValueError("Invalid simulator.")
-
-    return sampler, backend
 
 def setup_ibm_service(instance: str = "utokyo-kawasaki/keio-internal/keio-students") -> QiskitRuntimeService:
     """Setup the IBM qiskit runtime service.
@@ -56,7 +78,7 @@ def setup_ibm_service(instance: str = "utokyo-kawasaki/keio-internal/keio-studen
     Returns:
         QiskitRuntimeService: The qiskit runtime service
     """
-    
+
     with open("ibm_token.txt", "r") as file:
         token = file.read()
 
@@ -75,8 +97,8 @@ def transpile_circuit(circuit: QuantumCircuit, transpiler: str = "service") -> Q
     """Transpile the circuit with the transpiler service."""
 
     if transpiler == "service":
-        transpiler = TranspilerService( 
-            backend_name="ibm_kawasaki", 
+        transpiler = TranspilerService(
+            backend_name="ibm_kawasaki",
             ai=True,
             optimization_level=3
         )
@@ -94,29 +116,38 @@ def transpile_circuit(circuit: QuantumCircuit, transpiler: str = "service") -> Q
 
     return isa_circuit
 
-def setup_and_train_mps(cfg: DictConfig, X_train: np.ndarray) -> QuantumCircuit:
 
-    # config parameters
+def mps_cache_dir(cfg: DictConfig, X_train: np.ndarray) -> str:
+    """Absolute cache directory for a trained MPS.
+
+    Keyed on the MPS-relevant hyperparameters plus a hash of the actual training data, so runs that
+    share an MPS (same dataset/qubits/params and same train split — the common case across a sweep's
+    seeds and extensions) reuse one cache entry, while genuinely different train sets (e.g. BAS
+    holdout with different seeds) get their own.
+    """
+    data_hash = hashlib.md5(np.ascontiguousarray(X_train).tobytes()).hexdigest()[:10]
+    key = (f"{cfg['dataset']}_q{cfg['N_qubits']}_cut{cfg['cutoff']}"
+           f"_dsl{cfg['descenting_step_length']}_ds{cfg['descent_steps']}"
+           f"_tl{cfg['train_loops']}_{data_hash}")
+    return to_absolute_path(os.path.join("outputs", "mps_cache", key))
+
+
+def train_mps(cfg: DictConfig, X_train: np.ndarray, save_dir: str) -> QuantumCircuit:
+    """Train an MPS on X_train, decompose to a PQC, and persist both to save_dir."""
     n_qubits = cfg["N_qubits"]
-    cutoff = cfg["cutoff"]
-    descenting_step_length = cfg["descenting_step_length"]
-    descent_steps = cfg["descent_steps"]
-    train_loops = cfg["train_loops"]
 
-    # train MPS
     mps = MPS(n_qubits)
     mps.left_cano()
     mps.designate_data(X_train)
     mps.init_cumulants()
-    mps.cutoff = cutoff
-    mps.descenting_step_length = descenting_step_length
-    mps.descent_steps = descent_steps
-    mps.train(train_loops, rec_cut=False)
-    
-    save_dir = 'mps'
-    mps.saveMPS(save_dir)  # save dir will be created here
+    mps.cutoff = cfg["cutoff"]
+    mps.descenting_step_length = cfg["descenting_step_length"]
+    mps.descent_steps = cfg["descent_steps"]
+    mps.train(cfg["train_loops"], rec_cut=False)
 
-    # MPS to PQC decomposition
+    os.makedirs(save_dir, exist_ok=True)
+    mps.saveMPS(save_dir)  # writes tensors/ etc.
+
     print("Converting MPS to PQC")
     matrices = [np.expand_dims(mat, axis=2) for mat in mps.matrices]
     mps_tt = TT(matrices)
@@ -126,33 +157,20 @@ def setup_and_train_mps(cfg: DictConfig, X_train: np.ndarray) -> QuantumCircuit:
 
     return circuit
 
-def check_existing_mps(cfg: DictConfig) -> tuple[bool, str]:
 
-    # if no mps folder exists
-    if not os.path.exists("outputs/mps"):
-        return False, None
-    
-    # check if same mps run is in folder
-    for date in os.listdir("outputs/mps"):
-        for run in os.listdir(f"outputs/mps/{date}"):
-            curr_dir = f"outputs/mps/{date}/{run}"
-            with open(f"{curr_dir}/config.yaml") as file:
-                cfg_mps = yaml.full_load(file)
+def get_or_train_mps(cfg: DictConfig, X_train: np.ndarray) -> QuantumCircuit:
+    """Return the shared MPS-derived circuit, training it once into the cache on a miss.
 
-            if  cfg_mps["N_qubits"] == cfg["N_qubits"] and \
-                cfg_mps["dataset"] == cfg["dataset"] and \
-                cfg_mps["train_split"] == cfg["train_split"] and \
-                cfg_mps["cutoff"] == cfg["cutoff"] and \
-                cfg_mps["descenting_step_length"] == cfg["descenting_step_length"] and \
-                cfg_mps["descent_steps"] == cfg["descent_steps"] and \
-                cfg_mps["train_loops"] == cfg["train_loops"]:
-                
-                if cfg["dataset"] == "JGB" and cfg_mps["N_features"] == cfg["N_features"]:
-                    return True, curr_dir
-                elif cfg["dataset"] == "BAS" and cfg_mps["width"] == cfg["width"] and cfg_mps["height"] == cfg["height"]:
-                    return True, curr_dir
-    
-    return False, None
+    The MPS depends only on the training data + MPS hyperparameters (not on extension/seed), so the
+    whole sweep shares cache entries. Pre-training once (see src/__main__.pretrain_mps) before the
+    parallel fan-out means the seed-workers only ever read this cache — no training race.
+    """
+    cache_dir = mps_cache_dir(cfg, X_train)
+    circuit_path = os.path.join(cache_dir, "circuit.qpy")
+    if os.path.exists(circuit_path):
+        with open(circuit_path, "rb") as file:
+            return qpy.load(file)[0]
+    return train_mps(cfg, X_train, cache_dir)
 
 def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_train: pd.DataFrame) -> QuantumCircuit:
 
@@ -180,12 +198,12 @@ def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_tra
         extension_connections = []
         extended_circuit = mps_circuit
         logger.info(f"No extension applied.")
-    
+
     # linear extension
     elif extension == "all_to_all":
         extension_connections = all_to_all_topology(n_qubits)
         extended_circuit = extend_circuit(mps_circuit, init_connections, extension_connections)
-    
+
     # nearest neighbor extension
     elif extension == "nearest_neighbor":
         assert dataset == "BAS", "Nearest neighbor extension only implemented for BAS dataset."
@@ -232,56 +250,234 @@ def setup_dataloader(cfg: DictConfig) -> DataLoader:
 
     return DataLoader(dataset)
 
-def setup_and_train_qcbm(cfg: DictConfig):
-    
-    # config parameters
-    simulator = cfg["simulator"]
-    train_split = cfg["train_split"]
-    shots = cfg["N_shots"]
-    batchsize = cfg["batchsize"]
-    loss_func = cfg["loss_func"]
-    sigmas = cfg["sigmas"]
-    iterations = cfg["iterations"]
-    adam_learning_rate = cfg["adam_learning_rate"]
-    finite_diff_epsilon = cfg["finite_diff_epsilon"]
-    kernel_multithreading = cfg["kernel_multithreading"]
 
-    # variables
-    save_dir = 'qcbm'
+def compute_split(cfg: DictConfig, dataloader: DataLoader) -> tuple:
+    """Compute the leakage-safe 3-way split once, using the per-run seed for BAS holdout."""
+    return dataloader.train_val_test_split(
+        cfg["train_split"], cfg["val_split"],
+        seed=cfg["random_seed"], bas_split_mode=cfg["bas_split_mode"])
+
+
+def _coerce(value: str):
+    """Best-effort int/float coercion for a CLI override value; falls back to the raw string."""
+    for cast in (int, float):
+        try:
+            return cast(value)
+        except ValueError:
+            continue
+    return value
+
+
+def build_sweep_config(cfg: DictConfig) -> dict:
+    """Build a wandb sweep_config describing the actual search space of this invocation.
+
+    The real grid is owned by Hydra (--multirun key=v1,v2,...), not wandb's own search engine, so
+    this only DOCUMENTS that grid for the wandb Sweep object/UI (parallel-coordinates, filtering) —
+    it is never used to drive execution. Detected from sys.argv: any `key=v1,v2,...` override
+    (Hydra's multirun list syntax) becomes a swept parameter; `key=[1,2]` (a literal list value,
+    e.g. sigmas) is left alone. The per-seed `random_seed` values (derived from
+    initial_random_seed + runs_batch_size, not a literal CLI override) are added explicitly.
+    """
+    parameters = {}
+    for arg in sys.argv[1:]:
+        if arg.startswith("-") or "=" not in arg:
+            continue
+        key, value = arg.split("=", 1)
+        if value.startswith("[") and value.endswith("]"):
+            continue  # a literal list value (e.g. sigmas=[1.0]), not a multirun sweep list
+        if "," in value:
+            parameters[key] = {"values": [_coerce(v) for v in value.split(",")]}
+
+    seeds = [cfg["initial_random_seed"] + i for i in range(cfg["runs_batch_size"])]
+    parameters["random_seed"] = {"values": seeds}
+
+    return {"method": "grid", "parameters": parameters}
+
+
+def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
+    """Return the shared wandb sweep_id for this (multi)run, creating it on first use.
+
+    Call this ONCE per process, before fanning out parallel seed-workers — it sets the
+    WANDB_SWEEP_ID environment variable, which every subsequent `wandb.init()` call (including in
+    spawned ProcessPoolExecutor children, which inherit the parent's environment) picks up
+    automatically to join the same real wandb Sweep, with no need for `wandb.agent()`.
+
+    Idempotent via the env var: if WANDB_SWEEP_ID is already set — because a previous Hydra job in
+    this same multirun process already created it, or because it was exported manually for a
+    multi-node launch (see scripts/sweep.sh) — it's reused as-is and no new sweep is created.
+
+    Only real wandb.sweep() calls happen when wandb_mode == "online" (it requires the backend);
+    for offline/disabled runs a local synthetic id is used instead so local/test runs need no
+    network access.
+    """
+    if os.environ.get("WANDB_SWEEP_ID"):
+        return os.environ["WANDB_SWEEP_ID"]
+
+    if cfg["wandb_mode"] == "online":
+        import wandb
+        entity = cfg["wandb_entity"]
+        sweep_id = wandb.sweep(build_sweep_config(cfg), project=cfg["wandb_project"],
+                               entity=entity if entity else None)
+    else:
+        sweep_id = f"local_{datetime.now():%Y%m%d_%H%M%S}_{socket.gethostname()}"
+
+    os.environ["WANDB_SWEEP_ID"] = sweep_id
+    return sweep_id
+
+
+def _init_wandb(cfg: DictConfig, group: str):
+    """Initialize a wandb run for one seed; returns the run (or None if disabled).
+
+    Joining the sweep created by get_or_create_wandb_sweep happens automatically: wandb.init()
+    reads the WANDB_SWEEP_ID environment variable (already set before this is called) and attaches
+    the run server-side — no sweep_id kwarg or tag needed here.
+    """
+    import wandb
+    entity = cfg["wandb_entity"]
+    return wandb.init(
+        project=cfg["wandb_project"],
+        entity=entity if entity else None,
+        group=group,
+        # no explicit `name`: let wandb assign its default generated name — the swept params
+        # (group) and seed are already stored in config and don't need to be baked into it.
+        job_type="train",
+        config=OmegaConf.to_container(cfg, resolve=True),
+        mode=cfg["wandb_mode"],
+        reinit=True,
+    )
+
+
+def _configure_worker_logging(output_dir: str, seed: int) -> None:
+    """Configure logging inside a (possibly spawned) worker process.
+
+    ProcessPoolExecutor's default "spawn" start method (used on macOS/Windows, and available on
+    Linux) starts each worker as a fresh interpreter that does NOT inherit the parent's logging
+    config — hydra's INFO-level setup only exists in the parent, so without this, every
+    logger.info() call in a parallel (runs_batch_size > 1) run is silently dropped below WARNING.
+    When train_worker is instead called directly in the parent process (runs_batch_size == 1, no
+    pool), the "QCBM" logger already inherits hydra's INFO level, so this is a no-op.
+
+    We check/configure the "QCBM" logger specifically (not root): some imported library (observed:
+    wandb) attaches its own handler to the root logger even in a fresh spawned process, so
+    `root.hasHandlers()` is not a reliable signal — but that handler sits at the default WARNING
+    level, so `isEnabledFor(INFO)` on our own logger correctly detects whether INFO records would
+    actually get through.
+
+    Adds a console handler (seed-tagged, since parallel workers interleave on stdout) and a per-seed
+    log file under the run's output directory, so training progress is always visible somewhere.
+    """
+    logger = logging.getLogger("QCBM")
+    if logger.isEnabledFor(logging.INFO):
+        return  # INFO already reaches a handler (e.g. hydra configured this in the parent process)
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # avoid double/mis-formatted output via whatever root already has
+
+    formatter = logging.Formatter(
+        f"[%(asctime)s][seed={seed}][%(name)s][%(levelname)s] - %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    log_dir = os.path.join(output_dir, f"qcbm_seed{seed}")
+    os.makedirs(log_dir, exist_ok=True)
+    file_handler = logging.FileHandler(os.path.join(log_dir, "train.log"))
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+def train_worker(cfg_container: dict, seed: int, worker_index: int, group: str, output_dir: str) -> None:
+    """Top-level, picklable worker for ProcessPoolExecutor (spawn-safe).
+
+    Pins per-worker resources (GPU / threads), sets the run's seed, then trains one QCBM. Defined
+    here (not in __main__) so spawned child processes can import it.
+    """
+    _configure_worker_logging(output_dir, seed)
+
+    cfg = OmegaConf.create(cfg_container)
+    cfg.random_seed = seed
+
+    n_gpus = int(cfg.get("gpus_per_node", 0) or 0)
+    if n_gpus > 0:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_index % n_gpus)
+
+    workers = max(1, int(cfg.get("runs_batch_size", 1)))
+    n_cpu = os.cpu_count() or 1
+    os.environ.setdefault("OMP_NUM_THREADS", str(max(1, n_cpu // workers)))
+
+    setup_and_train_qcbm(cfg, group=group, output_dir=output_dir)
+
+
+def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str = "."):
+    """Train one QCBM for a single (already-seeded) config; one wandb run per call.
+
+    output_dir is the hydra run directory, passed explicitly because spawned worker processes do not
+    have an initialized HydraConfig (and version_base=None does not chdir into the run dir).
+    """
+
     logger = logging.getLogger("QCBM")
     start_time = time.time()
-    logger.info("Program started")
 
-    # Setup dataloader and split data
-    dataloader = setup_dataloader(cfg)
-    X_train, _, _, _ = dataloader.train_test_split(train_split)
+    # Idempotent: normally already created/set by __main__.py before the parallel fan-out (so
+    # every seed-worker inherits the same WANDB_SWEEP_ID); calling it again here is a no-op in that
+    # case, but also makes this function correct standalone (e.g. called directly, no __main__.py).
+    sweep_id = get_or_create_wandb_sweep(cfg)
+    logger.info(f"Program started (seed={cfg['random_seed']}, group={group}, sweep_id={sweep_id})")
 
-    # Train new MPS or load existing circuit
-    mps_exists, mps_path = check_existing_mps(cfg)
-    if mps_exists:
-        with open(f"{mps_path}/circuit.qpy", 'rb') as file:
-            circuit_mps = qpy.load(file)[0]
-    else:
-        circuit_mps = setup_and_train_mps(cfg, X_train)
+    run = _init_wandb(cfg, group)
 
-    # Setup circuit extensions and save extended circuit
-    circuit_ext, init_params = setup_circuit_extensions(cfg, circuit_mps, X_train)
-    with open(f"{save_dir}/ext_circuit.qpy", 'wb') as file:
-        qpy.dump(circuit_ext, file)
+    try:
+        # Setup dataloader and 3-way split (computed once, reused for MPS + QCBM)
+        dataloader = setup_dataloader(cfg)
+        X_train, X_val, X_test, X_train_count, X_val_count, X_test_count = compute_split(cfg, dataloader)
 
-    # Transpile Circuit if using real device backend
-    if simulator == "aer_kawasaki":
-        circuit = transpile_circuit(circuit, "service")
-    else:
-        circuit = circuit_ext.copy()
+        # Shared MPS (trained once upstream; cache hit here)
+        circuit_mps = get_or_train_mps(cfg, X_train)
 
-    # Train QCBM
-    sampler, backend = setup_qiskit_simulator(cfg["simulator"])
-    qcbm = QCBM(sampler, backend, circuit, init_params, adam_learning_rate, finite_diff_epsilon, kernel_multithreading)
-    qcbm.stochastic_gradient_descent(dataloader, iterations, shots, batchsize, loss_func, sigmas, train_split)
+        # Circuit extensions
+        circuit_ext, init_params = setup_circuit_extensions(cfg, circuit_mps, X_train)
 
-    # Save model
-    qcbm.save(save_dir)
-    logger.info("Program finished")
-    end_time = time.time()
-    logger.info(f"Program execution time: {round((end_time - start_time) / 60, 2)} minutes")
+        # per-seed output directory under the hydra run dir
+        save_dir = os.path.join(output_dir, f"qcbm_seed{cfg['random_seed']}")
+        os.makedirs(save_dir, exist_ok=True)
+        with open(f"{save_dir}/ext_circuit.qpy", "wb") as file:
+            qpy.dump(circuit_ext, file)
+
+        # Transpile only for the real-device backend
+        if cfg["simulator"] == "aer_kawasaki":
+            circuit = transpile_circuit(circuit_ext, "service")
+        else:
+            circuit = circuit_ext.copy()
+
+        # Train QCBM
+        sampler, backend, use_parameter_binds = setup_qiskit_simulator(cfg)
+        qcbm = QCBM(sampler, backend, circuit, init_params,
+                    cfg["adam_learning_rate"], cfg["finite_diff_epsilon"], cfg["gradient_workers"],
+                    use_parameter_binds=use_parameter_binds)
+        qcbm.stochastic_gradient_descent(
+            X_train, X_train_count, X_val_count, X_test_count,
+            cfg["iterations"], cfg["N_shots"], cfg["mmd_batch_size"],
+            cfg["loss_func"], cfg["sigmas"],
+            eval_every=cfg["eval_every"], model_selection_metric=cfg["model_selection_metric"],
+            wandb_run=run)
+
+        # Save model + checkpoint
+        qcbm.save(save_dir)
+
+        # Upload artifact and record best-model summary for the selection step
+        if run is not None:
+            import wandb
+            run.summary["best_mmd_val"] = qcbm.best_metric
+            run.summary["best_iter"] = qcbm.best_iter
+            run.summary["total_measurements"] = qcbm.total_measurements
+            artifact = wandb.Artifact(f"qcbm_{run.id}", type="model",
+                                      metadata={"seed": cfg["random_seed"], "group": group})
+            artifact.add_dir(save_dir)
+            run.log_artifact(artifact, aliases=[f"seed{cfg['random_seed']}"])
+
+        logger.info("Program finished")
+        logger.info(f"Program execution time: {round((time.time() - start_time) / 60, 2)} minutes")
+    finally:
+        if run is not None:
+            run.finish()

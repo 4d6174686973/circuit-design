@@ -1,192 +1,272 @@
 # other imports
 import numpy as np
 import logging
+import json
 import pandas as pd
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import time
 
 # qiskit imports
 from qiskit.circuit import QuantumCircuit
-from qiskit_ibm_runtime import SamplerV2
 from qiskit import qpy  # for saving the circuit as file
-from qiskit_aer import AerSimulator
 
 # own imports
-from src.utils import array_to_str
-from src.cost import adam, cost_mmd, cost_grad_mmd, cost_grad_kl_div
+from src.utils import array_to_str, sample_info
+from src.cost import adam, cost_mmd_pre, cost_grad_mmd_pre, cost_grad_kl_div
 from src.data import DataLoader
 
 
 class QCBM:
     def __init__(
             self,
-            sampler: SamplerV2,
-            backend: AerSimulator,
+            sampler,
+            backend,
             circuit: QuantumCircuit = None,
             parameters: np.ndarray = None,
             adam_learning_rate: float = 0.01,  # initial learning rate for Adam optimizer
             finite_diff_epsilon: float = 1.0e-8,  # finite difference epsilon for KL gradient
-            kernel_multithreading: bool = True,  # use multithreading for kernel computation
+            gradient_workers: int = 8,  # threads for the per-parameter gradient loop
+            use_parameter_binds: bool = True,  # True: direct AerSimulator.run fast path; False: SamplerV2 primitive (hardware)
             ) -> None:
 
         # member variables
-        self.sampler: SamplerV2 = sampler
-        self.backend: AerSimulator = backend
+        self.sampler = sampler
+        self.backend = backend
         self.circuit: QuantumCircuit = circuit
         self.parameters: np.ndarray = parameters  # current parameters
         assert len(parameters) == circuit.num_parameters, "Number of parameters does not match number of circuit parameters"
         self.adam_learning_rate: float = adam_learning_rate
         self.finite_diff_epsilon: float = finite_diff_epsilon
-        self.kernel_multithreading: bool = kernel_multithreading
+        self.gradient_workers: int = gradient_workers
+        self.use_parameter_binds: bool = use_parameter_binds
 
         # for training state and results
         self.weight_grad: np.ndarray = np.zeros(self.circuit.num_parameters)  # current weight gradients
-        self.parameter_hist: list[np.ndarray] = [self.parameters]  # store all parameters 
+        self.parameter_hist: list[np.ndarray] = [self.parameters]  # store all parameters
         self.losses: dict[str, list] = {
             "mmd_train": [],
+            "mmd_val": [],
             "mmd_test": [],
         }  # store all losses during training
 
-    def sample(self, N_shots: int) -> tuple:
-        '''Generates samples from the quantum circuit'''
-        pub = (self.circuit, self.parameters)
-        job = self.sampler.run([pub], shots=N_shots)
-        samples = job.result()[0].data.meas.get_counts()
-        return samples
+        # best checkpoint (model selection); populated during training
+        self.best_params: np.ndarray = self.parameters.copy()
+        self.best_iter: int = -1
+        self.best_metric: float = np.inf
+        self.model_selection_metric: str = "mmd_val"
+        self.total_measurements: int = 0  # cumulative circuit measurements over training
 
-    def param_shift_sampling(self, parameter_values: np.ndarray, shift: float,  N_shots: int = 10000) -> tuple:
-        """ Finite Difference Sampling for KL Divergence gradient computation
-            Implementation inspired by qiskit-algorithms (not maintained by IBM anymore)
-        Args:
-            parameter_values: List of parameter values for which to compute the gradient
-            N_shots: Number of shots for each parameter value
-            epsilon: Finite difference step size
-        Returns:
-            dist_plus: List of dictionaries with counts for the circuit with the shifted parameters
-            dist_minus: List of dictionaries with counts for the circuit with the shifted parameters
-            dist: List of counts for the circuit with the original parameters
+    def _run_binds(self, stack: np.ndarray, N_shots: int) -> list:
+        """Run a (n, P) stack of parameter sets and return a list of n count dicts.
+
+        Uses Aer's native parameter_binds fast path when available (simulation), else falls back to
+        a single 2D-parameter PUB through the SamplerV2 primitive (hardware).
         """
+        if self.use_parameter_binds:
+            binds = {p: stack[:, p.index] for p in self.circuit.parameters}
+            result = self.sampler.run(self.circuit, parameter_binds=[binds], shots=N_shots).result()
+            counts = result.get_counts()
+            return counts if isinstance(counts, list) else [counts]
+        # primitive path (hardware): one PUB with a 2D parameter array
+        result = self.sampler.run([(self.circuit, stack)], shots=N_shots).result()[0]
+        meas = result.data.meas
+        n = stack.shape[0]
+        flat = meas.reshape(n) if meas.shape else meas
+        return [flat[i].get_counts() for i in range(n)] if meas.shape else [meas.get_counts()]
 
-        # Setup variables
-        circuits = [self.circuit]
-        parameters = [self.circuit.parameters]
-        parameter_values = [parameter_values]
-        job_circuits, job_param_values, metadata = [], [], []
-        all_n = []
+    def sample(self, N_shots: int) -> dict:
+        '''Generates samples from the quantum circuit at the current parameters'''
+        stack = self.parameters.reshape(1, self.circuit.num_parameters)
+        return self._run_binds(stack, N_shots)[0]
 
-        for circuit, parameter_values_, parameters_ in zip(circuits, parameter_values, parameters):
+    def param_shift_sampling(self, parameter_values: np.ndarray, shift: float, N_shots: int = 10000) -> tuple:
+        """ Parameter-shift sampling for gradient computation.
 
-            assert isinstance(parameter_values_, np.ndarray), "Parameters must be a numpy array"
+        Builds a single (2P+1, P) stack of parameter sets (plus-shifted, minus-shifted, centre) and
+        runs them in one Aer native `parameter_binds` call instead of 2P+1 separate submissions.
 
-            # Indices of parameters to be differentiated
-            indices = [circuit.parameters.data.index(p) for p in parameters_]
-            metadata.append({"parameters": parameters_})
-            
-            # Combine inputs into a single job to reduce overhead.
-            offset = np.identity(circuit.num_parameters)[indices, :]
-            plus = parameter_values_ + shift * offset
-            minus = parameter_values_ - shift * offset
-            n = 2 * len(indices) + 1
-            job_circuits.extend([circuit] * n)
-            job_param_values.extend(plus.tolist() + minus.tolist() + parameter_values_.reshape(1,circuit.num_parameters).tolist())
-            all_n.append(n)
-        
-        # Run the job
-        pub = zip(job_circuits, job_param_values)
-        job = self.sampler.run(pub, shots=N_shots)
-        results = job.result()
-        
-        # Extract the results
-        partial_sum_n = 0
-        for n in all_n:
-            result = results[partial_sum_n : partial_sum_n + n]
-            result = [r.data.meas.get_counts() for r in result]
-            dist_plus, dist_minus, dist = result[: (n - 1) // 2], result[(n - 1) // 2 : n - 1], result[n - 1]
-        
+        Returns:
+            dist_plus:  list of P count dicts for the +shift circuits
+            dist_minus: list of P count dicts for the -shift circuits
+            dist:       count dict for the unshifted (centre) circuit
+        """
+        P = self.circuit.num_parameters
+        assert isinstance(parameter_values, np.ndarray), "Parameters must be a numpy array"
+
+        offset = np.identity(P)
+        plus = parameter_values + shift * offset          # (P, P)
+        minus = parameter_values - shift * offset         # (P, P)
+        centre = parameter_values.reshape(1, P)           # (1, P)
+        stack = np.concatenate([plus, minus, centre], axis=0)  # (2P+1, P)
+
+        counts = self._run_binds(stack, N_shots)
+        dist_plus = counts[:P]
+        dist_minus = counts[P:2 * P]
+        dist = counts[2 * P]
         return dist_plus, dist_minus, dist
 
+    def _mmd_gradient(self, T, T_probs, S, S_probs, dists_plus, dists_minus, sigmas):
+        """Compute the full MMD gradient vector, parallelized across parameters.
+
+        The target (T) and current-sample (S) arrays/probabilities are extracted once and reused
+        for every parameter; only the plus/minus distributions differ per parameter.
+        """
+        def grad_i(i):
+            Pn, P_probs = sample_info(dists_plus[i])
+            Mn, M_probs = sample_info(dists_minus[i])
+            return cost_grad_mmd_pre(T, T_probs, S, S_probs, Pn, P_probs, Mn, M_probs, sigmas)
+
+        n = self.circuit.num_parameters
+        workers = max(1, min(self.gradient_workers, n))
+        if workers == 1:
+            return np.array([grad_i(i) for i in range(n)])
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return np.array(list(executor.map(grad_i, range(n))))
+
     def stochastic_gradient_descent(
-            self, dataloader: DataLoader, iterations: int, N_shots: int, batchsize: int = 0,
-            loss_func: str = 'MMD', sigmas: list = [1.0], train_test_split: float = 0.8):
-        """ Stochastic Gradient Descent with KL Divergence and Finite Difference Sampling """
+            self, X_train: np.ndarray, X_train_count: dict, X_val_count: dict, X_test_count: dict,
+            iterations: int, N_shots: int, mmd_batch_size: int = 0,
+            loss_func: str = 'MMD', sigmas: list = [1.0],
+            eval_every: int = 1, model_selection_metric: str = 'mmd_val', wandb_run=None):
+        """ Stochastic Gradient Descent with parameter-shift / finite-difference sampling.
+
+        The train/validation/test splits are supplied by the caller (computed once upstream) so the
+        split is not recomputed here. Validation MMD drives model selection; the test MMD is logged
+        as a clean held-out metric only.
+        """
 
         logger = logging.getLogger('QCBM')
-
-        # get split from dataloader
-        X_train, _, X_train_count, X_test_count = dataloader.train_test_split(train_test_split)
+        self.model_selection_metric = model_selection_metric
+        sigmas = np.array(sigmas)
 
         # Parameters
         if loss_func == 'KL':
             shift = self.finite_diff_epsilon
-        elif loss_func == 'MMD':  
+        elif loss_func == 'MMD':
             shift = np.pi / 2
         else:
             raise ValueError("Loss Function not implemented")
 
         # Variables
         self.weight_grad = np.zeros(self.circuit.num_parameters)  # current weight gradients
-        [m, v] = [np.zeros(self.circuit.num_parameters) for _ in range(2)] # adam variables
- 
+        [m, v] = [np.zeros(self.circuit.num_parameters) for _ in range(2)]  # adam variables
+
+        # pre-extract the held-out targets once (unchanged across iterations)
+        T_train, T_train_probs = sample_info(X_train_count)
+        T_val, T_val_probs = sample_info(X_val_count) if len(X_val_count) else (None, None)
+        T_test, T_test_probs = sample_info(X_test_count) if len(X_test_count) else (None, None)
+
+        measurements_per_step = (2 * self.circuit.num_parameters + 1) * N_shots
+
         # Training loop
         for it in range(iterations):
 
             logger.info(f" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ")
             logger.info(f"| Iteration {it + 1} / {iterations}")
 
-            # Shuffle train set and use minibatch size
-            if batchsize == 0:
-                batch = X_train_count
+            # snapshot of the parameters that produce this iteration's samples S
+            params_snapshot = self.parameters.copy()
+
+            # target for the gradient step (full train set or a shuffled minibatch)
+            if mmd_batch_size == 0:
+                T_batch, T_batch_probs = T_train, T_train_probs
             else:
                 X_shuffled = X_train.copy()
                 np.random.shuffle(X_shuffled)
-                X_minibatch = X_shuffled[:batchsize, :]
-                batch = Counter(array_to_str(X_minibatch))
+                batch = Counter(array_to_str(X_shuffled[:mmd_batch_size, :]))
+                T_batch, T_batch_probs = sample_info(batch)
 
             # Parameter Shift Sampling
             start_time = time.time()
-            dists_plus, dists_minus, S = self.param_shift_sampling(self.parameters, shift, N_shots)
+            dists_plus, dists_minus, S_counts = self.param_shift_sampling(self.parameters, shift, N_shots)
             sample_time = time.time()
-            
+            self.total_measurements += measurements_per_step
+
             # Compute the gradient
-            for i, plus, minus in zip(range(self.circuit.num_parameters), dists_plus, dists_minus):
-                if loss_func == 'KL':
-                    self.weight_grad[i] = cost_grad_kl_div(batch, plus, minus, self.finite_diff_epsilon)
-                elif loss_func == 'MMD':
-                    self.weight_grad[i] = cost_grad_mmd(batch, S, plus, minus, np.array(sigmas), multithread=self.kernel_multithreading)
+            S, S_probs = sample_info(S_counts)
+            if loss_func == 'MMD':
+                self.weight_grad = self._mmd_gradient(T_batch, T_batch_probs, S, S_probs,
+                                                      dists_plus, dists_minus, sigmas)
+            elif loss_func == 'KL':
+                batch_dict = X_train_count if mmd_batch_size == 0 else Counter(array_to_str(X_train[:mmd_batch_size]))
+                self.weight_grad = np.array([
+                    cost_grad_kl_div(batch_dict, dists_plus[i], dists_minus[i], self.finite_diff_epsilon)
+                    for i in range(self.circuit.num_parameters)])
             grad_time = time.time()
 
             # Update parameters
             param_update, m, v = adam(self.adam_learning_rate, it, self.weight_grad, m, v)
-            self.parameters += param_update
+            self.parameters = self.parameters + param_update
             self.parameter_hist.append(self.parameters.copy())
 
-            # Compute loss on train and test set during training for logging
-            self.losses["mmd_train"].append(cost_mmd(X_train_count, S, np.array(sigmas), multithread=self.kernel_multithreading))
-            self.losses["mmd_test"].append(cost_mmd(X_test_count, S, np.array(sigmas), multithread=self.kernel_multithreading))
+            # Evaluate held-out losses (every eval_every iterations and on the final iteration)
+            do_eval = (it % eval_every == 0) or (it == iterations - 1)
+            if do_eval:
+                mmd_train = cost_mmd_pre(T_train, T_train_probs, S, S_probs, sigmas)
+                mmd_val = cost_mmd_pre(T_val, T_val_probs, S, S_probs, sigmas) if T_val is not None else np.nan
+                mmd_test = cost_mmd_pre(T_test, T_test_probs, S, S_probs, sigmas) if T_test is not None else np.nan
+            else:
+                mmd_train = mmd_val = mmd_test = np.nan
+            self.losses["mmd_train"].append(mmd_train)
+            self.losses["mmd_val"].append(mmd_val)
+            self.losses["mmd_test"].append(mmd_test)
             loss_time = time.time()
-            
+
+            # Model selection: keep the checkpoint (pre-update params) with the best metric
+            if do_eval:
+                sel = {"mmd_train": mmd_train, "mmd_val": mmd_val, "mmd_test": mmd_test}[model_selection_metric]
+                if np.isfinite(sel) and sel < self.best_metric:
+                    self.best_metric = float(sel)
+                    self.best_iter = it
+                    self.best_params = params_snapshot
+
+            # wandb logging (cumulative_measurements every step for the MMD-vs-measurements x-axis)
+            if wandb_run is not None:
+                log = {
+                    "iteration": it,
+                    "measurements_per_step": measurements_per_step,
+                    "cumulative_measurements": self.total_measurements,
+                    "num_parameters": self.circuit.num_parameters,
+                    "time/total_s": grad_time - start_time,
+                    "time/sampling_s": sample_time - start_time,
+                    "time/gradient_s": grad_time - sample_time,
+                    "time/loss_s": loss_time - grad_time,
+                }
+                if do_eval:
+                    log.update({"mmd_train": mmd_train, "mmd_val": mmd_val, "mmd_test": mmd_test})
+                wandb_run.log(log, step=it)
+
             # Final logging
-            mmd_train_loss = np.round(self.losses["mmd_train"][-1], 6)
-            mmd_test_loss = np.round(self.losses["mmd_test"][-1], 6)
-
             logger.info(f"| Total = {np.round(grad_time - start_time, 2)} s | Sampling = {np.round(sample_time - start_time, 2)} s | Gradient = {np.round(grad_time - sample_time, 2)} s | Loss = {np.round(loss_time - grad_time, 2)} s")
-            logger.info(f"| MMD loss | Train = {mmd_train_loss} | Test = {mmd_test_loss}")
+            logger.info(f"| MMD loss | Train = {np.round(mmd_train, 6)} | Val = {np.round(mmd_val, 6)} | Test = {np.round(mmd_test, 6)}")
 
-        logger.info("Training finished")
+        logger.info(f"Training finished | best {model_selection_metric} = {np.round(self.best_metric, 6)} @ iter {self.best_iter}")
 
     def save(self, save_dir: str):
-        '''Save the model'''
-        
+        '''Save the model, including the best checkpoint for benchmarking.'''
+
         # save losses as file
         losses_df = pd.DataFrame(self.losses)
         losses_df.to_parquet(f"{save_dir}/losses.parquet")
 
-        # save params as file
+        # save full parameter history
         np.save(f"{save_dir}/params.npy", np.array(self.parameter_hist, dtype=object), allow_pickle=True)
+
+        # save best checkpoint parameters + metadata for model selection / benchmarking
+        np.save(f"{save_dir}/best_params.npy", np.asarray(self.best_params, dtype=float))
+        with open(f"{save_dir}/checkpoint_meta.json", "w") as f:
+            json.dump({
+                "best_iter": self.best_iter,
+                "best_metric": self.best_metric,
+                "model_selection_metric": self.model_selection_metric,
+                "total_measurements": self.total_measurements,
+                "num_parameters": int(self.circuit.num_parameters),
+            }, f, indent=2)
 
         # save circuit as file
         with open(f"{save_dir}/circuit.qpy", 'wb') as file:
             qpy.dump(self.circuit, file)
-        
+
     def load(self):
         raise NotImplementedError("Loading not implemented yet")
