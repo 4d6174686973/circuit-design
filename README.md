@@ -3,28 +3,20 @@ This repository includes the source code for simulations carried out in Ref. [[1
 
 ## First setup
 
-Setup virtual environment
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management. Install uv once (e.g. `brew install uv`), then from the repo root:
+
 ```sh
-python3 -m venv .venv
+uv sync
 ```
 
-Activate virtual environment
-```sh
-source venv/bin/activate
-```
-
-Install dependencies
-```sh
-pip install -r requirements.txt
-```
+This creates `.venv/` with the pinned Python version (see `.python-version`) and installs all dependencies from the lockfile `uv.lock`, including the dev tools (pytest, ipykernel). No manual venv activation is needed — prefix commands with `uv run` instead.
 
 Download JGB dataset from: [https://www.mof.go.jp/english/policy/jgbs/reference/interest_rate/index.htm](https://www.mof.go.jp/english/policy/jgbs/reference/interest_rate/index.htm) and insert in this project `data/jgbcme_all.csv`
 
 ## Project Structure
 
-- `.devcontainer/` for running the devcontainer
 - `data/` need to create this folder by yourself when adding data files
-- `results/`
+- `results v1/`
     - `runs/...` results of the numerical simulations 
     - `plot_figures.ipynb` plot the figures for the paper 
 - `src/` code for running simulations
@@ -41,26 +33,30 @@ Download JGB dataset from: [https://www.mof.go.jp/english/policy/jgbs/reference/
 ## Singlerun
 Running a single simulation based on current config file `src/conf/config.yaml`
 ```sh
-python -m src
+uv run python -m src
 ```
 Results will be saved in `outputs/`
 
 ## Multirun
 Running multiple simulations sequentially based on same config file but changing config parameters e.g. the extension method
 ```sh
-python -m src --multirun extension=none,metric_based,all_to_all
+uv run python -m src --multirun extension=none,metric_based,all_to_all
 ```
 Important for running simulations with random extension is changing the random_seed, which is somehow fixed when using multirun from hydra
 ```sh
-python -m src --multirun random_seed=42,43,44,45,46
+uv run python -m src --multirun random_seed=42,43,44,45,46
 ```
 Results will be saved in `multirun/`
 
 ## Testing and code coverage
 ```sh
-pytest src/tests
-pytest --cov=src
+uv run pytest src/tests
+uv run pytest --cov=src
 ```
+
+## Updating dependencies
+
+Add or remove packages with `uv add <package>` / `uv remove <package>` (use `--dev` for dev-only tools). Upgrade everything within the constraints in `pyproject.toml` with `uv lock --upgrade && uv sync`.
 
 ## Reference
 

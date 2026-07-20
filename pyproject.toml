@@ -1,0 +1,50 @@
+[project]
+name = "circuit-design"
+version = "2.0.0"
+description = "Circuit Design based on Feature Similarity for Quantum Generative Modeling"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # standard packages
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "statsmodels",
+
+    # small utils
+    "pickleshare",   # to change workspace in notebooks
+    "pyarrow",       # for parquet files
+    "fastparquet",   # for parquet files
+    "hydra-core",    # for config files
+    "networkx",      # for plotting graphs
+
+    # quantum packages
+    "qiskit==1.2.4", # need version 1.2.4 for using transpiler service
+    "qiskit-ibm-runtime",
+    "qiskit-aer",
+    "qiskit-transpiler-service",
+
+    # visualization
+    "matplotlib",
+    "seaborn",
+    "pylatexenc",    # for latex in matplotlib
+    "scienceplots",  # https://github.com/garrettj403/SciencePlots
+
+    # mps decomp
+    "scikit-tt",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel",
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.uv.sources]
+scikit-tt = { git = "https://github.com/PGelss/scikit_tt", rev = "53b4a7ba95cd4e187b7fa014bd54fa9b31bc7e0a" }
+
+[tool.uv]
+# not a distributable package: code is run from the repo root via `uv run python -m src`
+package = false

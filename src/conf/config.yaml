@@ -1,6 +1,6 @@
 ### Data setup ###
-N_qubits: 9                     # number of qubits
-dataset: BAS                    # BAS, JGB
+N_qubits: 12                     # number of qubits
+dataset: JGB                    # BAS, JGB
 train_split: 0.8                # pct of trainset samples between 0 and 1
 width: 3                        # width of the BAS image
 height: 3                       # height of the BAS image
