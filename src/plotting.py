@@ -201,7 +201,9 @@ def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by
     if bench_df is None or bench_df.empty:
         return None
     if metric_cols is None:
-        metric_cols = [c for c in ["test/mmd", "test/tv", "test/fidelity"] if c in bench_df]
+        metric_cols = [c for c in ["test/mmd", "test/tv", "test/fidelity",
+                                   "gen/validity", "gen/coverage", "gen/fidelity", "gen/rate"]
+                       if c in bench_df]
     metric_cols = [c for c in metric_cols if c in bench_df]
     if not metric_cols:
         return None
@@ -227,6 +229,54 @@ def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by
     return fig
 
 
+def plot_generalization_bars(bench_df: pd.DataFrame, group_by: str = "circuit.extension",
+                             metrics=("gen/validity", "gen/coverage", "gen/fidelity", "gen/rate"),
+                             plots_dir: str = "plots", filename: str = "generalization_metrics",
+                             colors: dict = None, save: bool = True):
+    """Grouped bar chart of the Gili et al. validity-based generalization metrics.
+
+    One bar cluster per metric (validity, coverage, fidelity, rate), one bar per group (extension).
+    Only draws metrics present in bench_df; returns None when none are present or all values are NaN
+    -- i.e. for JGB sweeps or BAS `full_support` sweeps, where these metrics are undefined (they
+    require training on a strict subset of the valid space, i.e. bas_split_mode=holdout).
+
+    Sources: Gili, Mauri & Perdomo-Ortiz, arXiv:2207.13645 (Quantum Sci. Technol. 8, 035021, 2023);
+    Gili et al., Phys. Rev. Applied 21, 044032 (2024), arXiv:2201.08770.
+    """
+    if bench_df is None or bench_df.empty:
+        return None
+    metrics = [m for m in metrics if m in bench_df]
+    if not metrics:
+        return None
+    sub = bench_df[[group_by, *metrics]].copy()
+    sub = sub[sub[metrics].notna().any(axis=1)].reset_index(drop=True)  # drop undefined groups
+    if sub.empty:
+        return None
+
+    keys = list(sub[group_by])
+    labels = [_EXTENSION_LABELS.get(k, str(k)) for k in keys]
+    colors = colors or default_colors(keys)
+    n_groups, n_metrics = len(keys), len(metrics)
+    x = np.arange(n_metrics)
+    width = 0.8 / max(n_groups, 1)
+
+    fig, ax = plt.subplots(1, 1, figsize=(1.3 * n_metrics + 1.5, 3))
+    for i, (k, lab) in enumerate(zip(keys, labels)):
+        vals = [sub.loc[i, m] for m in metrics]
+        offset = (i - (n_groups - 1) / 2) * width
+        ax.bar(x + offset, vals, width, label=lab, color=colors.get(k))
+    ax.set_xticks(x)
+    ax.set_xticklabels([m.split("/")[-1] for m in metrics])
+    ax.set_ylabel("score")
+    ax.set_ylim(0, 1)
+    ax.set_title("Generalization (unseen valid space)")
+    ax.legend(loc="upper right", fontsize=6)
+    plt.tight_layout()
+    if save:
+        _save(fig, plots_dir, filename)
+    return fig
+
+
 def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
                  n_shots: int = 10000, n_q: int = 100, plots_dir: str = "plots", save: bool = True):
     """Per-group QQ plots (model vs data, model vs normal, data vs normal) for JGB best models."""
@@ -242,7 +292,7 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
         print(f"[plotting]     [{key}] QQ plots from best run {best.id}...")
         circuit, params = bm.load_checkpoint(best)
         samples = bm.sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
-        splits, _ = bm._test_split_for_config(cfg)
+        splits, _, _ = bm._test_split_for_config(cfg)
         jgb = JGB(cfg.data.N_qubits, cfg.data.N_features); dl = DataLoader(jgb)
         dl.train_val_test_split(cfg.data.train_split, cfg.data.val_split)
         xmin, xmax = dl.conv_min_max
@@ -308,6 +358,9 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     print("[plotting] (2/2) benchmarking best model per group...")
     bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by)
     plot_metric_table(bench_df, group_by=group_by, plots_dir=plots_dir)
+    if dataset == "BAS":
+        # Gili et al. generalization bars (no-op unless the sweep used bas_split_mode=holdout)
+        plot_generalization_bars(bench_df, group_by=group_by, plots_dir=plots_dir)
     if dataset == "JGB":
         plot_qq_grid(sweep_id, entity, project, group_by, plots_dir=plots_dir)
     print("[plotting]     done.")
@@ -328,7 +381,7 @@ def _parse_args(argv=None):
     parser.add_argument("--sweep-id", required=True,
                         help="wandb sweep id, e.g. printed in a run's log line "
                              "'Program started (..., sweep_id=...)', or from the Sweeps tab.")
-    parser.add_argument("--project", required=True, help="wandb project name.")
+    parser.add_argument("--project", default="qcbm-circuit-design", help="wandb project name.")
     parser.add_argument("--entity", default=None, help="wandb entity (default: your default entity).")
     parser.add_argument("--dataset", choices=["BAS", "JGB"], default="BAS")
     parser.add_argument("--group-by", default="circuit.extension",

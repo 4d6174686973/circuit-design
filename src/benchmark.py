@@ -92,6 +92,92 @@ def spurious_mass(samples: dict, valid_patterns: np.ndarray) -> float:
 
 
 # --------------------------------------------------------------------------------------------------
+# generalization metrics (validity-based) -- Gili et al.
+#
+# Established in:
+#   * D. Gili, M. Mauri, A. Perdomo-Ortiz, "Do Quantum Circuit Born Machines Generalize?",
+#     Quantum Sci. Technol. 8, 035021 (2023). arXiv:2207.13645.
+#   * K. Gili, M. Hibat-Allah, M. Mauri, C. Ballance, A. Perdomo-Ortiz, "Generalization Metrics for
+#     Practical Quantum Advantage in Generative Models", Phys. Rev. Applied 21, 044032 (2024).
+#     arXiv:2201.08770.
+#
+# These measure a model trained on a STRICT SUBSET of the valid solution space by how well it
+# generates unseen-yet-valid samples (true generalization, not memorization). They are therefore
+# only defined for the BAS `holdout` split (train subset of valid space); under `full_support`
+# (train == valid space) there is no unseen valid space and everything but `validity` is NaN.
+# --------------------------------------------------------------------------------------------------
+def _to_bitstring_set(patterns) -> set:
+    """Normalize a pattern container to a set of bitstrings.
+
+    Accepts a {bitstring: count} dict (uses its keys), a 2-D binary ndarray (one row per pattern),
+    or an iterable of bitstrings -- so callers can pass either the Counter splits or the raw
+    enumerated-pattern arrays used elsewhere in this module.
+    """
+    if patterns is None:
+        return set()
+    if isinstance(patterns, dict):
+        return set(patterns.keys())
+    arr = np.asarray(patterns)
+    if arr.dtype.kind in ("U", "S", "O"):   # already bitstrings
+        return set(np.atleast_1d(arr).tolist())
+    return set(array_to_str(np.atleast_2d(arr)))
+
+
+def generalization_metrics(samples: dict, train_patterns, valid_patterns) -> dict:
+    """Validity-based generalization metrics for constraint-satisfaction generative models.
+
+    Following Gili, Mauri & Perdomo-Ortiz (arXiv:2207.13645) and Gili et al. (Phys. Rev. Applied 21,
+    044032, 2024; arXiv:2201.08770). Quantifies generation of unseen-yet-valid samples from a model
+    trained on a strict subset of the valid space -- i.e. generalization rather than memorization.
+
+    Let Q be the number of queries (shots, counted WITH multiplicity), G_new the queries outside the
+    training set, G_sol the queries that are valid AND outside the training set, g_sol the number of
+    UNIQUE unseen-valid bitstrings generated, S the valid solution space and T the training-set size:
+
+        validity    = (# queries landing in S) / Q            fraction of samples that are valid
+        exploration = |G_new| / Q                             fraction of samples that are novel
+        fidelity    = |G_sol| / |G_new|                       precision: novel samples that are valid
+        rate        = |G_sol| / Q      (= exploration*fidelity)   efficiency of useful generation
+        coverage    = g_sol / (|S| - T)                       recall of the unseen valid space
+
+    Counts are with multiplicity except `coverage` (unique bitstrings). Returns keys prefixed
+    "gen/" to disambiguate `gen/fidelity` (this precision measure) from `test/fidelity`
+    (the Bhattacharyya distribution fidelity). Metrics are NaN when their denominator is empty
+    (Q=0, no novel samples, or no unseen valid space under `full_support`).
+    """
+    train_set = _to_bitstring_set(train_patterns)
+    valid_set = _to_bitstring_set(valid_patterns)
+    unseen_valid = valid_set - train_set
+
+    nan = float("nan")
+    Q = sum(samples.values())
+    if Q == 0:
+        return {"gen/validity": nan, "gen/exploration": nan, "gen/fidelity": nan,
+                "gen/rate": nan, "gen/coverage": nan}
+
+    q_valid = q_new = q_sol = 0
+    unique_sol = set()
+    for bitstring, c in samples.items():
+        is_valid = bitstring in valid_set
+        is_new = bitstring not in train_set
+        if is_valid:
+            q_valid += c
+        if is_new:
+            q_new += c
+        if is_valid and is_new:
+            q_sol += c
+            unique_sol.add(bitstring)
+
+    return {
+        "gen/validity": float(q_valid / Q),
+        "gen/exploration": float(q_new / Q),
+        "gen/fidelity": float(q_sol / q_new) if q_new > 0 else nan,
+        "gen/rate": float(q_sol / Q),
+        "gen/coverage": float(len(unique_sol) / len(unseen_valid)) if unseen_valid else nan,
+    }
+
+
+# --------------------------------------------------------------------------------------------------
 # JGB-specific metrics (binarized continuous, per feature)
 # --------------------------------------------------------------------------------------------------
 def reconstruct_features(samples: dict, bits_per_feature: int, num_features: int,
@@ -175,7 +261,7 @@ def gaussian_baseline_jgb(decimal_train: np.ndarray, bits_per_feature: int, n_fe
 # top-level evaluation
 # --------------------------------------------------------------------------------------------------
 def evaluate(samples: dict, splits: dict, dataset_kind: str, sigmas=np.array([1.0]),
-             valid_patterns: np.ndarray = None) -> dict:
+             valid_patterns: np.ndarray = None, train_patterns=None) -> dict:
     """Run the appropriate metric bundle over each named split and return a flat metric dict.
 
     Args:
@@ -183,6 +269,9 @@ def evaluate(samples: dict, splits: dict, dataset_kind: str, sigmas=np.array([1.
         splits: {split_name: target_count_dict}, e.g. {"val": ..., "test": ...}
         dataset_kind: "BAS" or "JGB"
         valid_patterns: enumerated valid BAS patterns (required for BAS coverage/spurious mass)
+        train_patterns: seen (training-split) patterns as a Counter/ndarray; when supplied together
+            with valid_patterns for BAS, the Gili et al. validity-based generalization metrics
+            (gen/*) are added, computed against the held-out unseen valid space (valid \\ train).
     """
     metrics = {}
     for name, target in splits.items():
@@ -195,6 +284,8 @@ def evaluate(samples: dict, splits: dict, dataset_kind: str, sigmas=np.array([1.
     if dataset_kind == "BAS" and valid_patterns is not None:
         metrics["coverage"] = mode_coverage(samples, valid_patterns)
         metrics["spurious_mass"] = spurious_mass(samples, valid_patterns)
+        if train_patterns is not None:
+            metrics.update(generalization_metrics(samples, train_patterns, valid_patterns))
     return metrics
 
 
@@ -252,18 +343,23 @@ def sample_model(circuit, params: np.ndarray, n_shots: int, seed: int = 0) -> di
 
 
 def _test_split_for_config(cfg) -> tuple:
-    """Reconstruct the held-out test target + dataset context from a run's config."""
+    """Reconstruct the held-out targets + dataset context from a run's config.
+
+    Returns (splits, valid_patterns, train_counts): the val/test target dicts used for the
+    distribution-distance metrics, the enumerated valid patterns (BAS only, else None), and the
+    training-split counts (used for the generalization metrics' seen-set).
+    """
     from src.data import BAS, JGB, DataLoader
     if cfg.data.dataset == "BAS":
         dataset = BAS(cfg.data.width, cfg.data.height)
     else:
         dataset = JGB(cfg.data.N_qubits, cfg.data.N_features)
     dl = DataLoader(dataset)
-    _, X_val, X_test, _, c_val, c_test = dl.train_val_test_split(
+    _, X_val, X_test, c_train, c_val, c_test = dl.train_val_test_split(
         cfg.data.train_split, cfg.data.val_split,
         seed=cfg.sweep.random_seed, bas_split_mode=cfg.data.bas_split_mode)
     valid_patterns = dataset.binary if cfg.data.dataset == "BAS" else None
-    return {"val": c_val, "test": c_test}, valid_patterns
+    return {"val": c_val, "test": c_test}, valid_patterns, c_train
 
 
 def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
@@ -303,13 +399,14 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "c
               f"downloading checkpoint...")
         circuit, params = load_checkpoint(best)
         cfg = from_run_config(best.config)
-        splits, valid_patterns = _test_split_for_config(cfg)
+        splits, valid_patterns, train_counts = _test_split_for_config(cfg)
         print(f"[benchmark]     [{key}] sampling {n_shots} shots and evaluating metrics...")
         samples = sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
         row = {group_by: key, "run_id": best.id, "run_name": best.name,
                "best_mmd_val": best.summary.get(metric)}
         row.update(evaluate(samples, splits, cfg.data.dataset,
                             sigmas=np.array(cfg.qcbm.sigmas),
-                            valid_patterns=valid_patterns))
+                            valid_patterns=valid_patterns,
+                            train_patterns=train_counts))
         rows.append(row)
     return pd.DataFrame(rows)
