@@ -164,6 +164,5 @@ cython_debug/
 outputs/
 plots/
 multirun/
-data/
 wandb/
 artifacts/
