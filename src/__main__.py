@@ -4,6 +4,7 @@ import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
+import src.config_schema  # noqa: F401 -- registers Config with Hydra's ConfigStore
 from src.setup import train_worker, get_or_create_wandb_sweep
 
 
@@ -18,7 +19,7 @@ def pretrain_mps(cfg: DictConfig, seeds: list) -> None:
     trained = set()
     for seed in seeds:
         c = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-        c.random_seed = seed
+        c.sweep.random_seed = seed
         dataloader = setup_dataloader(c)
         X_train, *_ = compute_split(c, dataloader)
         key = mps_cache_dir(c, X_train)
@@ -31,7 +32,7 @@ def pretrain_mps(cfg: DictConfig, seeds: list) -> None:
 @hydra.main(config_path="conf", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
 
-    seeds = [cfg.initial_random_seed + i for i in range(cfg.runs_batch_size)]
+    seeds = [cfg.sweep.initial_random_seed + i for i in range(cfg.sweep.runs_batch_size)]
     hydra_cfg = HydraConfig.get()
     group = hydra_cfg.job.override_dirname or "single"
     output_dir = hydra_cfg.runtime.output_dir
@@ -48,12 +49,12 @@ def main(cfg: DictConfig) -> None:
 
     cfg_container = OmegaConf.to_container(cfg, resolve=True)
 
-    if cfg.runs_batch_size == 1:
+    if cfg.sweep.runs_batch_size == 1:
         train_worker(cfg_container, seeds[0], 0, group, output_dir)
         return
 
     # Fan out the auto-seeded batch across processes (one wandb run per seed).
-    with ProcessPoolExecutor(max_workers=cfg.runs_batch_size) as executor:
+    with ProcessPoolExecutor(max_workers=cfg.sweep.runs_batch_size) as executor:
         futures = [executor.submit(train_worker, cfg_container, seed, i, group, output_dir)
                    for i, seed in enumerate(seeds)]
         for f in futures:

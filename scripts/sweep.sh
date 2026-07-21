@@ -12,12 +12,12 @@
 # override-splitting.
 #
 # Usage:
-#   sbatch [--array=0-N] scripts/sweep.sh 'extension=none,metric_based,all_to_all'
-#   bash scripts/sweep.sh 'extension=metric_based extension_threshhold=0.3,0.5,0.7'   # local, no SLURM
+#   sbatch [--array=0-N] scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'
+#   bash scripts/sweep.sh 'circuit.extension=metric_based circuit.extension_threshhold=0.3,0.5,0.7'   # local, no SLURM
 #
 # Examples:
-#   sbatch scripts/sweep.sh 'extension=none,metric_based,all_to_all'                  # 1 node
-#   sbatch --array=0-3 scripts/sweep.sh 'extension=none,metric_based,all_to_all'      # 4 nodes,
+#   sbatch scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'                  # 1 node
+#   sbatch --array=0-3 scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'      # 4 nodes,
 #       # each running the SAME grid but with a disjoint block of seeds (see NODE_INITIAL_SEED below)
 #
 # NOTE (SLURM): --output/--error directories must already exist before you `sbatch` this script --
@@ -120,11 +120,11 @@ echo ">>> [Run] WANDB_SWEEP_ID=${WANDB_SWEEP_ID:-<created by this node>}"
 uv run --no-sync python -m src --multirun \
     ${OVERRIDES} \
     dataset="${DATASET}" \
-    N_qubits="${N_QUBITS}" \
-    runs_batch_size="${RUNS_BATCH_SIZE}" \
-    initial_random_seed="${NODE_INITIAL_SEED}" \
-    simulator="${SIMULATOR}" \
-    gpus_per_node="${GPUS_PER_NODE}" \
-    wandb_mode="${WANDB_MODE}"
+    data.N_qubits="${N_QUBITS}" \
+    sweep.runs_batch_size="${RUNS_BATCH_SIZE}" \
+    sweep.initial_random_seed="${NODE_INITIAL_SEED}" \
+    ibm.simulator="${SIMULATOR}" \
+    sweep.gpus_per_node="${GPUS_PER_NODE}" \
+    logging.wandb_mode="${WANDB_MODE}"
 
 echo ">>> [Run] Task ${TASK_ID} finished successfully."

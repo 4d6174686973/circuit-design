@@ -40,21 +40,37 @@ uv run python -m src
 ```
 Results will be saved in `outputs/`
 
+Dataset-specific settings (`N_qubits`, `width`/`height`, `N_features`, `extension_metric`, ...) live in
+`src/conf/dataset/BAS.yaml` and `src/conf/dataset/JGB.yaml`, both merged into the same base
+`src/conf/config.yaml` layout. Switch between them with the single `dataset` override, on the CLI or
+via `scripts/sweep.sh`'s `DATASET` env var:
+```sh
+uv run python -m src dataset=BAS
+uv run python -m src dataset=JGB
+```
+Every other field is grouped hierarchically to match the config's sections -- `data`, `ibm`, `aer`,
+`mps`, `circuit`, `qcbm`, `sweep`, `logging` -- e.g. `cfg.mps.cutoff`, `cfg.qcbm.iterations`,
+`cfg.sweep.runs_batch_size`, so an override looks like `mps.cutoff=1e-4` or `qcbm.iterations=50`.
+`src/config_schema.py` defines a typed schema (`Config`, with one nested dataclass per group) for
+every field above; composing an unknown key or a wrongly-typed override fails fast at startup
+instead of surfacing as a runtime `AttributeError`.
+
 ## Multirun
 Running multiple simulations sequentially based on same config file but changing config parameters e.g. the extension method
 ```sh
-uv run python -m src --multirun extension=none,metric_based,all_to_all
+uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all
 ```
 Results will be saved in `multirun/`
 
 ## Parallel seeds (batching)
-For each hyperparameter combination (e.g. each `extension` above), you can run several repeats with
-different random seeds in parallel. You only ever set `initial_random_seed`; the `runs_batch_size`
-parallel repeats are auto-seeded as `initial_random_seed + i` and logged individually — there is no
-separate seed parameter to set per run, so runs can't accidentally collide on the same seed.
+For each hyperparameter combination (e.g. each `circuit.extension` above), you can run several repeats
+with different random seeds in parallel. You only ever set `sweep.initial_random_seed`; the
+`sweep.runs_batch_size` parallel repeats are auto-seeded as `initial_random_seed + i` and logged
+individually — there is no separate seed parameter to set per run, so runs can't accidentally
+collide on the same seed.
 ```sh
-uv run python -m src --multirun extension=none,metric_based,all_to_all \
-    runs_batch_size=5 initial_random_seed=42
+uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all \
+    sweep.runs_batch_size=5 sweep.initial_random_seed=42
 ```
 This runs 3 extensions x 5 seeds (42-46) = 15 trainings, 5 running in parallel at a time.
 
@@ -65,16 +81,16 @@ Every invocation above — a single run, a local `--multirun`, or a `scripts/swe
 parallel-coordinates plots etc.), no extra flags needed. The Hydra grid (and `runs_batch_size`'s
 auto-seeded repeats) is what actually determines what gets run — wandb is not used to choose
 hyperparameters (no `wandb agent`), only to track and organize the resulting runs. Each run's
-`group` is its swept-parameter combination (e.g. `extension=metric_based`); seeds within a group are
-its repeats.
+`group` is its swept-parameter combination (e.g. `circuit.extension=metric_based`); seeds within a
+group are its repeats.
 
-By default `wandb_mode: online` in `src/conf/config.yaml`, so **run `wandb login` once** before your
-first sweep (or pass `wandb_mode=offline` to log locally and `wandb sync` later, or
-`wandb_mode=disabled` to skip wandb entirely, e.g. for quick local testing):
+By default `logging.wandb_mode: online` in `src/conf/config.yaml`, so **run `wandb login` once**
+before your first sweep (or pass `logging.wandb_mode=offline` to log locally and `wandb sync` later,
+or `logging.wandb_mode=disabled` to skip wandb entirely, e.g. for quick local testing):
 ```sh
-uv run python -m src --multirun extension=none,metric_based,all_to_all wandb_mode=offline
+uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all logging.wandb_mode=offline
 ```
-Project/entity are set via `wandb_project` / `wandb_entity` in the config (or as CLI overrides).
+Project/entity are set via `logging.wandb_project` / `logging.wandb_entity` in the config (or as CLI overrides).
 
 For a cluster/SLURM launch (multi-node, proper resource requests, automatic disjoint seed-sharding
 across nodes, and leader/worker synchronization so every node's runs join the *same* sweep), use

@@ -41,7 +41,7 @@ def setup_qiskit_simulator(cfg: DictConfig) -> tuple:
     Returns:
         (runner, backend, use_parameter_binds)
     """
-    simulator = cfg["simulator"]
+    simulator = cfg.ibm.simulator
 
     if simulator in ("aer_statevec_cpu", "aer_statevec_gpu"):
         device = "GPU" if simulator == "aer_statevec_gpu" else "CPU"
@@ -49,16 +49,16 @@ def setup_qiskit_simulator(cfg: DictConfig) -> tuple:
             "method": "statevector",
             "device": device,
             "runtime_parameter_bind_enable": True,
-            "max_parallel_experiments": cfg["aer_max_parallel_experiments"],
-            "max_parallel_shots": cfg["aer_max_parallel_shots"],
-            "seed_simulator": cfg["random_seed"],
+            "max_parallel_experiments": cfg.aer.aer_max_parallel_experiments,
+            "max_parallel_shots": cfg.aer.aer_max_parallel_shots,
+            "seed_simulator": cfg.sweep.random_seed,
         }
         if device == "GPU":
             backend_options["batched_shots_gpu"] = True
-            backend_options["batched_shots_gpu_max_qubits"] = cfg["aer_batched_shots_gpu_max_qubits"]
-            if cfg["N_qubits"] >= cfg["aer_blocking_qubits_threshold"]:
+            backend_options["batched_shots_gpu_max_qubits"] = cfg.aer.aer_batched_shots_gpu_max_qubits
+            if cfg.data.N_qubits >= cfg.aer.aer_blocking_qubits_threshold:
                 backend_options["blocking_enable"] = True
-                backend_options["blocking_qubits"] = cfg["aer_blocking_qubits"]
+                backend_options["blocking_qubits"] = cfg.aer.aer_blocking_qubits
         backend = AerSimulator(**backend_options)
         return backend, backend, True
 
@@ -126,24 +126,24 @@ def mps_cache_dir(cfg: DictConfig, X_train: np.ndarray) -> str:
     holdout with different seeds) get their own.
     """
     data_hash = hashlib.md5(np.ascontiguousarray(X_train).tobytes()).hexdigest()[:10]
-    key = (f"{cfg['dataset']}_q{cfg['N_qubits']}_cut{cfg['cutoff']}"
-           f"_dsl{cfg['descenting_step_length']}_ds{cfg['descent_steps']}"
-           f"_tl{cfg['train_loops']}_{data_hash}")
+    key = (f"{cfg.data.dataset}_q{cfg.data.N_qubits}_cut{cfg.mps.cutoff}"
+           f"_dsl{cfg.mps.descenting_step_length}_ds{cfg.mps.descent_steps}"
+           f"_tl{cfg.mps.train_loops}_{data_hash}")
     return to_absolute_path(os.path.join("outputs", "mps_cache", key))
 
 
 def train_mps(cfg: DictConfig, X_train: np.ndarray, save_dir: str) -> QuantumCircuit:
     """Train an MPS on X_train, decompose to a PQC, and persist both to save_dir."""
-    n_qubits = cfg["N_qubits"]
+    n_qubits = cfg.data.N_qubits
 
     mps = MPS(n_qubits)
     mps.left_cano()
     mps.designate_data(X_train)
     mps.init_cumulants()
-    mps.cutoff = cfg["cutoff"]
-    mps.descenting_step_length = cfg["descenting_step_length"]
-    mps.descent_steps = cfg["descent_steps"]
-    mps.train(cfg["train_loops"], rec_cut=False)
+    mps.cutoff = cfg.mps.cutoff
+    mps.descenting_step_length = cfg.mps.descenting_step_length
+    mps.descent_steps = cfg.mps.descent_steps
+    mps.train(cfg.mps.train_loops, rec_cut=False)
 
     os.makedirs(save_dir, exist_ok=True)
     mps.saveMPS(save_dir)  # writes tensors/ etc.
@@ -175,20 +175,20 @@ def get_or_train_mps(cfg: DictConfig, X_train: np.ndarray) -> QuantumCircuit:
 def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_train: pd.DataFrame) -> QuantumCircuit:
 
     # config parameters
-    n_qubits = cfg["N_qubits"]
-    n_random_extensions = cfg["N_random_extensions"]
-    dataset = cfg["dataset"]
-    extension = cfg["extension"]
-    extension_metric = cfg["extension_metric"]
-    extension_threshhold = cfg["extension_threshhold"]
-    width = cfg["width"]
-    height = cfg["height"]
-    random_seed = cfg["random_seed"]
+    n_qubits = cfg.data.N_qubits
+    n_random_extensions = cfg.circuit.N_random_extensions
+    dataset = cfg.data.dataset
+    extension = cfg.circuit.extension
+    extension_metric = cfg.circuit.extension_metric
+    extension_threshhold = cfg.circuit.extension_threshhold
+    width = cfg.data.width
+    height = cfg.data.height
+    random_seed = cfg.sweep.random_seed
 
     logger = logging.getLogger('QCBM')
 
     # linear baseline connections
-    init_order = list(range(cfg["N_qubits"]))
+    init_order = list(range(cfg.data.N_qubits))
     init_connections = linear_topology(init_order)
 
     # extend circuit by method
@@ -243,10 +243,10 @@ def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_tra
     return circuit, init_params
 
 def setup_dataloader(cfg: DictConfig) -> DataLoader:
-    if cfg["dataset"] == "BAS":
-        dataset = BAS(cfg["width"], cfg["height"])
-    elif cfg["dataset"] == "JGB":
-        dataset = JGB(cfg["N_qubits"], cfg["N_features"])
+    if cfg.data.dataset == "BAS":
+        dataset = BAS(cfg.data.width, cfg.data.height)
+    elif cfg.data.dataset == "JGB":
+        dataset = JGB(cfg.data.N_qubits, cfg.data.N_features)
 
     return DataLoader(dataset)
 
@@ -254,8 +254,8 @@ def setup_dataloader(cfg: DictConfig) -> DataLoader:
 def compute_split(cfg: DictConfig, dataloader: DataLoader) -> tuple:
     """Compute the leakage-safe 3-way split once, using the per-run seed for BAS holdout."""
     return dataloader.train_val_test_split(
-        cfg["train_split"], cfg["val_split"],
-        seed=cfg["random_seed"], bas_split_mode=cfg["bas_split_mode"])
+        cfg.data.train_split, cfg.data.val_split,
+        seed=cfg.sweep.random_seed, bas_split_mode=cfg.data.bas_split_mode)
 
 
 def _coerce(value: str):
@@ -288,7 +288,7 @@ def build_sweep_config(cfg: DictConfig) -> dict:
         if "," in value:
             parameters[key] = {"values": [_coerce(v) for v in value.split(",")]}
 
-    seeds = [cfg["initial_random_seed"] + i for i in range(cfg["runs_batch_size"])]
+    seeds = [cfg.sweep.initial_random_seed + i for i in range(cfg.sweep.runs_batch_size)]
     parameters["random_seed"] = {"values": seeds}
 
     return {"method": "grid", "parameters": parameters}
@@ -319,10 +319,10 @@ def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
     if os.environ.get("WANDB_SWEEP_ID"):
         return os.environ["WANDB_SWEEP_ID"]
 
-    if cfg["wandb_mode"] == "online":
+    if cfg.logging.wandb_mode == "online":
         import wandb
-        entity = cfg["wandb_entity"]
-        sweep_id = wandb.sweep(build_sweep_config(cfg), project=cfg["wandb_project"],
+        entity = cfg.logging.wandb_entity
+        sweep_id = wandb.sweep(build_sweep_config(cfg), project=cfg.logging.wandb_project,
                                entity=entity if entity else None)
     else:
         sweep_id = f"local_{datetime.now():%Y%m%d_%H%M%S}_{socket.gethostname()}"
@@ -351,16 +351,16 @@ def _init_wandb(cfg: DictConfig, group: str, sweep_id: str):
     per-call override applied on top of that singleton, so it's correct regardless of caching.
     """
     import wandb
-    entity = cfg["wandb_entity"]
+    entity = cfg.logging.wandb_entity
     return wandb.init(
-        project=cfg["wandb_project"],
+        project=cfg.logging.wandb_project,
         entity=entity if entity else None,
         group=group,
         # no explicit `name`: let wandb assign its default generated name — the swept params
         # (group) and seed are already stored in config and don't need to be baked into it.
         job_type="train",
         config=OmegaConf.to_container(cfg, resolve=True),
-        mode=cfg["wandb_mode"],
+        mode=cfg.logging.wandb_mode,
         settings=wandb.Settings(sweep_id=sweep_id),
         reinit=True,
     )
@@ -415,13 +415,13 @@ def train_worker(cfg_container: dict, seed: int, worker_index: int, group: str, 
     _configure_worker_logging(output_dir, seed)
 
     cfg = OmegaConf.create(cfg_container)
-    cfg.random_seed = seed
+    cfg.sweep.random_seed = seed
 
-    n_gpus = int(cfg.get("gpus_per_node", 0) or 0)
+    n_gpus = int(cfg.sweep.gpus_per_node or 0)
     if n_gpus > 0:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_index % n_gpus)
 
-    workers = max(1, int(cfg.get("runs_batch_size", 1)))
+    workers = max(1, int(cfg.sweep.runs_batch_size))
     n_cpu = os.cpu_count() or 1
     os.environ.setdefault("OMP_NUM_THREADS", str(max(1, n_cpu // workers)))
 
@@ -442,7 +442,7 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
     # every seed-worker inherits the same WANDB_SWEEP_ID); calling it again here is a no-op in that
     # case, but also makes this function correct standalone (e.g. called directly, no __main__.py).
     sweep_id = get_or_create_wandb_sweep(cfg)
-    logger.info(f"Program started (seed={cfg['random_seed']}, group={group}, sweep_id={sweep_id})")
+    logger.info(f"Program started (seed={cfg.sweep.random_seed}, group={group}, sweep_id={sweep_id})")
 
     run = _init_wandb(cfg, group, sweep_id)
 
@@ -458,13 +458,13 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
         circuit_ext, init_params = setup_circuit_extensions(cfg, circuit_mps, X_train)
 
         # per-seed output directory under the hydra run dir
-        save_dir = os.path.join(output_dir, f"qcbm_seed{cfg['random_seed']}")
+        save_dir = os.path.join(output_dir, f"qcbm_seed{cfg.sweep.random_seed}")
         os.makedirs(save_dir, exist_ok=True)
         with open(f"{save_dir}/ext_circuit.qpy", "wb") as file:
             qpy.dump(circuit_ext, file)
 
         # Transpile only for the real-device backend
-        if cfg["simulator"] == "aer_kawasaki":
+        if cfg.ibm.simulator == "aer_kawasaki":
             circuit = transpile_circuit(circuit_ext, "service")
         else:
             circuit = circuit_ext.copy()
@@ -472,13 +472,13 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
         # Train QCBM
         sampler, backend, use_parameter_binds = setup_qiskit_simulator(cfg)
         qcbm = QCBM(sampler, backend, circuit, init_params,
-                    cfg["adam_learning_rate"], cfg["finite_diff_epsilon"], cfg["gradient_workers"],
+                    cfg.qcbm.adam_learning_rate, cfg.qcbm.finite_diff_epsilon, cfg.aer.gradient_workers,
                     use_parameter_binds=use_parameter_binds)
         qcbm.stochastic_gradient_descent(
             X_train, X_train_count, X_val_count, X_test_count,
-            cfg["iterations"], cfg["N_shots"], cfg["mmd_batch_size"],
-            cfg["loss_func"], cfg["sigmas"],
-            eval_every=cfg["eval_every"], model_selection_metric=cfg["model_selection_metric"],
+            cfg.qcbm.iterations, cfg.qcbm.N_shots, cfg.qcbm.mmd_batch_size,
+            cfg.qcbm.loss_func, cfg.qcbm.sigmas,
+            eval_every=cfg.qcbm.eval_every, model_selection_metric=cfg.qcbm.model_selection_metric,
             wandb_run=run)
 
         # Save model + checkpoint
@@ -497,10 +497,10 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
             run.summary["best_iter"] = qcbm.best_iter
             run.summary["total_measurements"] = qcbm.total_measurements
             artifact = wandb.Artifact(f"qcbm_{run.id}", type="model",
-                                      metadata={"seed": cfg["random_seed"], "group": group})
+                                      metadata={"seed": cfg.sweep.random_seed, "group": group})
             artifact.add_file(f"{save_dir}/circuit.qpy")
             artifact.add_file(f"{save_dir}/best_params.npy")
-            run.log_artifact(artifact, aliases=[f"seed{cfg['random_seed']}"])
+            run.log_artifact(artifact, aliases=[f"seed{cfg.sweep.random_seed}"])
 
         logger.info("Program finished")
         logger.info(f"Program execution time: {round((time.time() - start_time) / 60, 2)} minutes")

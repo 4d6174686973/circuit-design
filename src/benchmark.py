@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats as ss
 
-from src.utils import sample_info, array_to_str, get_features_for_quasi_dist
+from src.utils import sample_info, array_to_str, get_features_for_quasi_dist, get_nested
 from src.cost import cost_mmd
 
 
@@ -252,25 +252,28 @@ def sample_model(circuit, params: np.ndarray, n_shots: int, seed: int = 0) -> di
 def _test_split_for_config(config: dict):
     """Reconstruct the held-out test target + dataset context from a run's logged config."""
     from src.data import BAS, JGB, DataLoader
-    if config["dataset"] == "BAS":
-        dataset = BAS(config["width"], config["height"])
+    data_cfg = config["data"]
+    if data_cfg["dataset"] == "BAS":
+        dataset = BAS(data_cfg["width"], data_cfg["height"])
     else:
-        dataset = JGB(config["N_qubits"], config["N_features"])
+        dataset = JGB(data_cfg["N_qubits"], data_cfg["N_features"])
     dl = DataLoader(dataset)
     _, X_val, X_test, _, c_val, c_test = dl.train_val_test_split(
-        config["train_split"], config["val_split"],
-        seed=config["random_seed"], bas_split_mode=config.get("bas_split_mode", "full_support"))
-    valid_patterns = dataset.binary if config["dataset"] == "BAS" else None
+        data_cfg["train_split"], data_cfg["val_split"],
+        seed=get_nested(config, "sweep.random_seed"),
+        bas_split_mode=data_cfg.get("bas_split_mode", "full_support"))
+    valid_patterns = dataset.binary if data_cfg["dataset"] == "BAS" else None
     return {"val": c_val, "test": c_test}, valid_patterns
 
 
-def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "extension",
+def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
                     n_shots: int = 10000, metric: str = "best_mmd_val") -> pd.DataFrame:
     """Benchmark the best model per group of a sweep.
 
-    For each group (value of `group_by`), select the seed-run with the lowest validation MMD, load its
-    best checkpoint, sample it, and evaluate the full metric suite on the held-out test split.
-    Returns a tidy table with one row per group.
+    For each group (value of `group_by`, a dot-separated path into the run's nested config, e.g.
+    "circuit.extension"), select the seed-run with the lowest validation MMD, load its best
+    checkpoint, sample it, and evaluate the full metric suite on the held-out test split. Returns a
+    tidy table with one row per group.
     """
     import wandb
     api = wandb.Api()
@@ -279,7 +282,7 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "e
 
     groups = {}
     for r in runs:
-        key = r.config.get(group_by)
+        key = get_nested(r.config, group_by)
         groups.setdefault(key, []).append(r)
 
     rows = []
@@ -294,11 +297,11 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "e
         circuit, params = load_checkpoint(best)
         splits, valid_patterns = _test_split_for_config(best.config)
         print(f"[benchmark]     [{key}] sampling {n_shots} shots and evaluating metrics...")
-        samples = sample_model(circuit, params, n_shots, seed=best.config.get("random_seed", 0))
+        samples = sample_model(circuit, params, n_shots, seed=get_nested(best.config, "sweep.random_seed", 0))
         row = {group_by: key, "run_id": best.id, "run_name": best.name,
                "best_mmd_val": best.summary.get(metric)}
-        row.update(evaluate(samples, splits, best.config["dataset"],
-                            sigmas=np.array(best.config.get("sigmas", [1.0])),
+        row.update(evaluate(samples, splits, best.config["data"]["dataset"],
+                            sigmas=np.array(get_nested(best.config, "qcbm.sigmas", [1.0])),
                             valid_patterns=valid_patterns))
         rows.append(row)
     return pd.DataFrame(rows)

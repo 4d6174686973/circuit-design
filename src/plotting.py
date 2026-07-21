@@ -22,7 +22,7 @@ import networkx as nx
 from src.extension import (add_su4_gate, linear_topology, nearest_neighbor_topology,
                            all_to_all_topology, metric_based_topology)
 from src.data import BAS, JGB, DataLoader, init_qubit_order_bas
-from src.utils import varInfoMat, get_features_for_quasi_dist, array_to_str
+from src.utils import varInfoMat, get_features_for_quasi_dist, array_to_str, get_nested
 from src import benchmark as bm
 
 
@@ -82,22 +82,24 @@ def _save(fig, plots_dir, filename):
 # --------------------------------------------------------------------------------------------------
 # wandb fetch + aggregation
 # --------------------------------------------------------------------------------------------------
-def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "extension",
+def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
                filters: dict = None) -> dict:
     """Return {legend_key: [runs]} for a real wandb Sweep, grouped by a config dimension.
 
-    filters is an optional {config_key: value} dict to pin non-legend swept params (facet slicing),
-    applied client-side since Sweep.runs is a materialized list, not a server-side query.
+    group_by and filters keys are dot-separated paths into the run's nested config, e.g.
+    "circuit.extension". filters is an optional {config_key: value} dict to pin non-legend swept
+    params (facet slicing), applied client-side since Sweep.runs is a materialized list, not a
+    server-side query.
     """
     import wandb
     api = wandb.Api()
     entity = entity or api.default_entity  # unresolved None would literally build ".../None/..."
     runs = list(api.sweep(f"{entity}/{project}/{sweep_id}").runs)
     if filters:
-        runs = [r for r in runs if all(r.config.get(k) == v for k, v in filters.items())]
+        runs = [r for r in runs if all(get_nested(r.config, k) == v for k, v in filters.items())]
     grouped = {}
     for r in runs:
-        grouped.setdefault(r.config.get(group_by), []).append(r)
+        grouped.setdefault(get_nested(r.config, group_by), []).append(r)
     return grouped
 
 
@@ -107,9 +109,9 @@ def fetch_history(run, metric: str = "mmd_train") -> pd.DataFrame:
     df = run.history(keys=keys, pandas=True)
     if df is None or df.empty or metric not in df:
         # fallback: reconstruct measurements from config if not logged
-        n = run.config.get("iterations", 0)
+        n = get_nested(run.config, "qcbm.iterations", 0)
         P = run.summary.get("num_parameters") or run.config.get("num_parameters", 0)
-        shots = run.config.get("N_shots", 0)
+        shots = get_nested(run.config, "qcbm.N_shots", 0)
         per = (2 * P + 1) * shots
         df = pd.DataFrame({"cumulative_measurements": np.arange(1, n + 1) * per,
                            metric: [np.nan] * n})
@@ -351,7 +353,7 @@ def plot_jgb_topology(N_qubits=12, N_features=3, threshold=0.95, plots_dir: str 
 # --------------------------------------------------------------------------------------------------
 # benchmark figures (best model per group)
 # --------------------------------------------------------------------------------------------------
-def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by: str = "extension",
+def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by: str = "circuit.extension",
                       plots_dir: str = "plots", filename: str = "benchmark_table", save: bool = True,
                       precision: int = 4):
     """Table of benchmark metrics across groups (one row per group's best model).
@@ -389,20 +391,20 @@ def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by
     return fig
 
 
-def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "extension",
+def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
                  n_shots: int = 10000, n_q: int = 100, plots_dir: str = "plots", save: bool = True):
     """Per-group QQ plots (model vs data, model vs normal, data vs normal) for JGB best models."""
     grouped = fetch_runs(sweep_id, entity, project, group_by)
     figs = {}
     for key, runs in grouped.items():
         best = bm.select_best_run(runs)
-        if best is None or best.config.get("dataset") != "JGB":
+        if best is None or get_nested(best.config, "data.dataset") != "JGB":
             continue
         print(f"[plotting]     [{key}] QQ plots from best run {best.id}...")
         circuit, params = bm.load_checkpoint(best)
-        samples = bm.sample_model(circuit, params, n_shots, seed=best.config.get("random_seed", 0))
+        samples = bm.sample_model(circuit, params, n_shots, seed=get_nested(best.config, "sweep.random_seed", 0))
         splits, _ = bm._test_split_for_config(best.config)
-        cfg = best.config
+        cfg = best.config["data"]
         jgb = JGB(cfg["N_qubits"], cfg["N_features"]); dl = DataLoader(jgb)
         dl.train_val_test_split(cfg["train_split"], cfg["val_split"])
         xmin, xmax = dl.conv_min_max
@@ -434,7 +436,7 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "exte
 # orchestrator
 # --------------------------------------------------------------------------------------------------
 def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: dict,
-                         group_by: str = "extension", metrics=("mmd_train", "mmd_test"),
+                         group_by: str = "circuit.extension", metrics=("mmd_train", "mmd_test"),
                          plots_dir: str = "plots", science_style: bool = True):
     """Generate the full figure set for a sweep: static dataset/topology + MMD-vs-measurements +
     best-model benchmark (metric table, and QQ grids for JGB). Saves PDFs to
@@ -509,9 +511,9 @@ def _parse_args(argv=None):
     parser.add_argument("--extension-threshold", type=float, default=None,
                         help="Threshold for the extension/topology figures "
                              "(default: 0.5 for BAS, 0.95 for JGB).")
-    parser.add_argument("--group-by", default="extension",
-                        help="Config key to use as the plot legend/grouping dimension "
-                             "(default: extension; can be any swept key, e.g. extension_threshhold).")
+    parser.add_argument("--group-by", default="circuit.extension",
+                        help="Dot-separated config key to use as the plot legend/grouping dimension "
+                             "(default: circuit.extension; can be any swept key, e.g. circuit.extension_threshhold).")
     parser.add_argument("--metrics", nargs="+", default=["mmd_train", "mmd_test"],
                         help="Logged metrics to plot vs. cumulative measurements.")
     parser.add_argument("--plots-dir", default="plots", help="Output directory for the PDFs/PNGs.")

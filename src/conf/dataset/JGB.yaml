@@ -1,0 +1,10 @@
+# @package _global_
+# Japanese Government Bond yields dataset. Select with `dataset=JGB` on the CLI or in scripts/sweep.sh.
+data:
+  dataset: JGB
+  N_qubits: 12                    # number of qubits
+  N_features: 3                   # number of features for JGB dataset, 3 or 4
+circuit:
+  N_random_extensions: 13         # number of random extensions to compare with metric_based
+  extension_metric: varinfo       # hamming, varinfo
+  extension_threshhold: 0.95      # threshold tuned for JGB + varinfo

@@ -1,59 +1,63 @@
-### Data setup ###
-N_qubits: 12                    # number of qubits
-dataset: JGB                    # BAS, JGB
-train_split: 0.7                # pct of trainset samples between 0 and 1
-val_split: 0.15                 # pct of validation samples; test = 1 - train_split - val_split
-bas_split_mode: full_support    # full_support (all patterns in every split) or holdout (seeded disjoint partition)
-width: 3                        # width of the BAS image
-height: 3                       # height of the BAS image
-N_features: 3                   # number of features for JGB dataset, 3 or 4
+defaults:
+  - config_schema
+  - dataset: JGB
+  - _self_
+
+### Data setup (dataset-independent) ###
+data:
+  train_split: 0.7                # pct of trainset samples between 0 and 1
+  val_split: 0.15                 # pct of validation samples; test = 1 - train_split - val_split
 
 ### IBM setup ###
-simulator: aer_statevec_cpu     # aer_statevec_cpu, aer_statevec_gpu, aer_kawasaki
-transpiler: service             # local or service (not used in statevector simulation)
-optimization_level: 3           # optimization for running the quantum circuit: 0, 1, 2, 3 (not used in statevector simulation)
-ai_transpiler: True             # True or False (not used in statevector simulation)
+ibm:
+  simulator: aer_statevec_cpu     # aer_statevec_cpu, aer_statevec_gpu, aer_kawasaki
+  transpiler: service             # local or service (not used in statevector simulation)
+  optimization_level: 3           # optimization for running the quantum circuit: 0, 1, 2, 3 (not used in statevector simulation)
+  ai_transpiler: True             # True or False (not used in statevector simulation)
 
 ### Aer performance ###
-aer_max_parallel_experiments: 0       # 0 = auto (across bound circuits); >0 caps parallel experiments
-aer_max_parallel_shots: 0             # 0 = auto; setting 1 disables batched parameter execution (much slower)
-aer_batched_shots_gpu_max_qubits: 16  # GPU batched-shots cutoff (only for aer_statevec_gpu)
-aer_blocking_qubits_threshold: 28     # enable multi-GPU blocking at/above this qubit count
-aer_blocking_qubits: 24               # chunk size for multi-GPU blocking
-gradient_workers: 8                   # threads for the per-parameter gradient loop
+aer:
+  aer_max_parallel_experiments: 0       # 0 = auto (across bound circuits); >0 caps parallel experiments
+  aer_max_parallel_shots: 0             # 0 = auto; setting 1 disables batched parameter execution (much slower)
+  aer_batched_shots_gpu_max_qubits: 16  # GPU batched-shots cutoff (only for aer_statevec_gpu)
+  aer_blocking_qubits_threshold: 28     # enable multi-GPU blocking at/above this qubit count
+  aer_blocking_qubits: 24               # chunk size for multi-GPU blocking
+  gradient_workers: 8                   # threads for the per-parameter gradient loop
 
 ### MPS setup ###
-cutoff: 5.0e-05                 # cutoff precision for the MPS
-descenting_step_length: 0.05    # step length for the descent
-descent_steps: 10               # number of steps for the descent
-train_loops: 10                 # number of loops for training
+mps:
+  cutoff: 5.0e-05                 # cutoff precision for the MPS
+  descenting_step_length: 0.05    # step length for the descent
+  descent_steps: 10               # number of steps for the descent
+  train_loops: 10                 # number of loops for training
 
 ### Circuit setup ###
-extension: metric_based         # none, all_to_all, nearest_neighbor, metric_based, random
-N_random_extensions: 10         # number of random extensions to compare with metric_based: 10 for BAS, 13 for JGB
-extension_metric: hamming       # hamming, varinfo
-extension_threshhold: 0.5       # 0.5 for BAS + hamming, 0.95 for JGB + varinfo
+circuit:
+  extension: metric_based         # none, all_to_all, nearest_neighbor, metric_based, random
 
 ### QCBM setup ###
-iterations: 10                  # number of training iterations
-mmd_batch_size: 1000            # 0 for using the full train set or positive integer for MMD mini-batch size
-N_shots: 1000                   # number of shots in sampling
-loss_func: MMD                  # MMD, KL (KL not working yet)
-sigmas: [1.0]                   # Bandwidth for MMD Kernel
-finite_diff_epsilon: 1.0e-8     # epsilon used in finite difference sampling for KL (does not work yet)
-adam_learning_rate: 0.01        # initial learning rate for ADAM
-eval_every: 1                   # compute full train/val/test MMD every k iterations (+ final)
-model_selection_metric: mmd_val # metric used to pick the best checkpoint (mmd_val recommended)
+qcbm:
+  iterations: 10                  # number of training iterations
+  mmd_batch_size: 1000            # 0 for using the full train set or positive integer for MMD mini-batch size
+  N_shots: 1000                   # number of shots in sampling
+  loss_func: MMD                  # MMD, KL (KL not working yet)
+  sigmas: [1.0]                   # Bandwidth for MMD Kernel
+  finite_diff_epsilon: 1.0e-8     # epsilon used in finite difference sampling for KL (does not work yet)
+  adam_learning_rate: 0.01        # initial learning rate for ADAM
+  eval_every: 1                   # compute full train/val/test MMD every k iterations (+ final)
+  model_selection_metric: mmd_val # metric used to pick the best checkpoint (mmd_val recommended)
 
 ### Sweep / batching ###
 # initial_random_seed is the ONLY seed you set. runs_batch_size auto-seeded runs are spawned per
 # hydra job, each derived as initial_random_seed + i (i = 0 .. runs_batch_size-1) and logged as the
 # run's effective seed -- there is no separate "random_seed" to set or accidentally collide on.
-runs_batch_size: 1               # number of auto-seeded training runs to run in parallel per hydra job
-initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
-gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
+sweep:
+  runs_batch_size: 1               # number of auto-seeded training runs to run in parallel per hydra job
+  initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
+  gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
 
 ### Logging ###
-wandb_project: qcbm-circuit-design
-wandb_entity: null              # null = your default wandb entity
-wandb_mode: online              # online, offline, disabled
+logging:
+  wandb_project: qcbm-circuit-design
+  wandb_entity: null              # null = your default wandb entity
+  wandb_mode: online              # online, offline, disabled
