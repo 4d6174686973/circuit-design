@@ -101,9 +101,9 @@ Every invocation above — a single run, a local `--multirun`, or a `scripts/swe
 — is automatically registered as a real **wandb Sweep** (visible under the Sweeps tab, with
 parallel-coordinates plots etc.), no extra flags needed. The Hydra grid (and `runs_batch_size`'s
 auto-seeded repeats) is what actually determines what gets run — wandb is not used to choose
-hyperparameters (no `wandb agent`), only to track and organize the resulting runs. Each run's
-`group` is its swept-parameter combination (e.g. `circuit.extension=metric_based`); seeds within a
-group are its repeats.
+hyperparameters (no `wandb agent`), only to track and organize the resulting runs. Every swept
+parameter is stored in each run's `config`, so runs are grouped/filtered by config key (e.g.
+`circuit.extension`) at plot time via `--group-by` — no wandb group is set on the runs themselves.
 
 By default `logging.wandb_mode: online` in `src/conf/config.yaml`, so **run `wandb login` once**
 before your first sweep (or pass `logging.wandb_mode=offline` to log locally and `wandb sync` later,

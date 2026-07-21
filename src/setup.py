@@ -424,7 +424,7 @@ def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
     return sweep_id
 
 
-def _init_wandb(cfg: DictConfig, group: str, sweep_id: str):
+def _init_wandb(cfg: DictConfig, sweep_id: str):
     """Initialize a wandb run for one seed; returns the run (or None if disabled).
 
     Joining the sweep is done via an EXPLICIT `settings=wandb.Settings(sweep_id=...)` override,
@@ -436,6 +436,10 @@ def _init_wandb(cfg: DictConfig, group: str, sweep_id: str):
     stale, sweep-less snapshot instead of re-reading the env var — this is exactly what produced
     runs that were created but not attached to the sweep. Passing sweep_id explicitly here is a
     per-call override applied on top of that singleton, so it's correct regardless of caching.
+
+    No wandb `group` is set: the swept parameters live in each run's `config`, so downstream
+    plotting/benchmarking filters/groups on config keys (e.g. circuit.extension) directly instead
+    of a redundant group string — which also sidesteps wandb's 128-char GroupName limit.
     """
     import wandb
     entity = cfg.logging.wandb_entity
@@ -453,9 +457,8 @@ def _init_wandb(cfg: DictConfig, group: str, sweep_id: str):
     return wandb.init(
         project=cfg.logging.wandb_project,
         entity=entity if entity else None,
-        group=group,
-        # no explicit `name`: let wandb assign its default generated name — the swept params
-        # (group) and seed are already stored in config and don't need to be baked into it.
+        # no explicit `name`/`group`: wandb assigns its default generated name and the swept params
+        # are already stored in config, so nothing needs to be baked into the name or a group.
         job_type="train",
         config=OmegaConf.to_container(cfg, resolve=True),
         mode=cfg.logging.wandb_mode,
@@ -504,7 +507,7 @@ def _configure_worker_logging(output_dir: str, seed: int) -> None:
     logger.addHandler(file_handler)
 
 
-def train_worker(cfg_container: dict, seed: int, worker_index: int, group: str, output_dir: str) -> None:
+def train_worker(cfg_container: dict, seed: int, worker_index: int, combo: str, output_dir: str) -> None:
     """Top-level, picklable worker for ProcessPoolExecutor (spawn-safe).
 
     Pins per-worker resources (GPU / threads), sets the run's seed, then trains one QCBM. Defined
@@ -532,11 +535,15 @@ def train_worker(cfg_container: dict, seed: int, worker_index: int, group: str, 
     apply_thread_env(threads_per_run)
     cfg.aer.gradient_workers = threads_per_run  # per-parameter gradient ThreadPoolExecutor size
 
-    setup_and_train_qcbm(cfg, group=group, output_dir=output_dir)
+    setup_and_train_qcbm(cfg, combo=combo, output_dir=output_dir)
 
 
-def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str = "."):
+def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str = "."):
     """Train one QCBM for a single (already-seeded) config; one wandb run per call.
+
+    `combo` is the swept-parameter combination string, used only for local log lines / artifact
+    metadata to tell parallel runs apart in the .err file -- it is NOT sent to wandb as a group (the
+    swept params live in the run's config; plotting/benchmarking filter on those directly).
 
     output_dir is the hydra run directory, passed explicitly because spawned worker processes do not
     have an initialized HydraConfig (and version_base=None does not chdir into the run dir).
@@ -549,9 +556,9 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
     # every seed-worker inherits the same WANDB_SWEEP_ID); calling it again here is a no-op in that
     # case, but also makes this function correct standalone (e.g. called directly, no __main__.py).
     sweep_id = get_or_create_wandb_sweep(cfg)
-    logger.info(f"Program started (seed={cfg.sweep.random_seed}, group={group}, sweep_id={sweep_id})")
+    logger.info(f"Program started (seed={cfg.sweep.random_seed}, combo={combo}, sweep_id={sweep_id})")
 
-    run = _init_wandb(cfg, group, sweep_id)
+    run = _init_wandb(cfg, sweep_id)
 
     try:
         # Setup dataloader and 3-way split (computed once, reused for MPS + QCBM)
@@ -604,7 +611,7 @@ def setup_and_train_qcbm(cfg: DictConfig, group: str = "single", output_dir: str
             run.summary["best_iter"] = qcbm.best_iter
             run.summary["total_measurements"] = qcbm.total_measurements
             artifact = wandb.Artifact(f"qcbm_{run.id}", type="model",
-                                      metadata={"seed": cfg.sweep.random_seed, "group": group})
+                                      metadata={"seed": cfg.sweep.random_seed, "combo": combo})
             artifact.add_file(f"{save_dir}/circuit.qpy")
             artifact.add_file(f"{save_dir}/best_params.npy")
             run.log_artifact(artifact, aliases=[f"seed{cfg.sweep.random_seed}"])

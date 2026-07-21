@@ -98,7 +98,9 @@ def main(cfg: DictConfig) -> None:
 
     seeds = [cfg.sweep.initial_random_seed + i for i in range(cfg.sweep.runs_batch_size)]
     hydra_cfg = HydraConfig.get()
-    group = hydra_cfg.job.override_dirname or "single"
+    # Local-only label for the .err log line and pool failure reporting (NOT a wandb group -- the
+    # swept params are stored in each run's wandb config and are filtered on from there instead).
+    combo = hydra_cfg.job.override_dirname or "single"
     output_dir = hydra_cfg.runtime.output_dir
     is_multirun = hydra_cfg.mode == RunMode.MULTIRUN
 
@@ -122,7 +124,7 @@ def main(cfg: DictConfig) -> None:
     # Fast path: a single, non-multirun run -> execute inline (no pool: lower overhead, exceptions
     # surface directly, simpler to debug/attach).
     if not is_multirun and cfg.sweep.runs_batch_size == 1:
-        train_worker(cfg_container, seeds[0], 0, group, output_dir)
+        train_worker(cfg_container, seeds[0], 0, combo, output_dir)
         return
 
     # Submit this combo's seed-runs to the shared pool WITHOUT blocking, so Hydra proceeds to the
@@ -131,9 +133,9 @@ def main(cfg: DictConfig) -> None:
     for seed in seeds:
         idx = _NEXT_WORKER_INDEX
         _NEXT_WORKER_INDEX += 1
-        label = f"{group}/seed{seed}"
+        label = f"{combo}/seed{seed}"
         _FUTURES.append(
-            (pool.submit(train_worker, cfg_container, seed, idx, group, output_dir), label))
+            (pool.submit(train_worker, cfg_container, seed, idx, combo, output_dir), label))
 
 
 if __name__ == "__main__":

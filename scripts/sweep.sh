@@ -24,7 +24,7 @@
 # --cpus-per-task and --time below for your cluster.
 # ==============================================================================
 #SBATCH -p pgi14                                # EDIT: your SLURM partition
-#SBATCH --job-name=qcbm-sweep
+#SBATCH --job-name=qcbm
 #SBATCH --error=outputs/slurm_logs/%A_%a.err    # %A = array job id, %a = array task id
 #SBATCH --output=outputs/slurm_logs/%A_%a.out
 #SBATCH --array=0                                # 0 = 1 node; 0-3 = 4 nodes (or pass --array on the CLI)
