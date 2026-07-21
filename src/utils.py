@@ -1,6 +1,36 @@
 import numpy as np
 import pandas as pd
 
+def bootstrap_mean_std(samples: np.ndarray, n_boot: int = 1000, seed: int = 0) -> tuple:
+    """Bootstrap the mean across runs (first axis) and the standard error of that mean.
+
+    Given `samples` of shape (n_runs, *rest) -- e.g. one scalar per run (n_runs,) or one curve per
+    run (n_runs, n_grid) -- draw `n_boot` resamples of the n_runs runs WITH REPLACEMENT, average
+    each resample over its runs, and return (mean, std) where:
+      - mean = mean over the n_boot resample-means (≈ the plain across-run mean),
+      - std  = std  over the n_boot resample-means (the bootstrap standard error of the mean).
+    Outputs have shape (*rest,) (0-d for scalar-per-run input). With a single run the std is 0.
+
+    Implemented with a per-resample draw-count weight matrix (n_boot x n_runs) @ samples rather than
+    materializing the full (n_boot, n_runs, *rest) tensor, so memory stays O(n_boot * (n_runs + R)).
+    """
+    samples = np.asarray(samples, dtype=float)
+    n_runs = samples.shape[0]
+    if n_runs == 0:
+        raise ValueError("need at least one run to bootstrap")
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n_runs, size=(n_boot, n_runs))          # resampled run indices
+    W = np.zeros((n_boot, n_runs))
+    for b in range(n_boot):
+        W[b] = np.bincount(idx[b], minlength=n_runs)              # how often each run was drawn
+    W /= n_runs
+    flat = samples.reshape(n_runs, -1)                            # (n_runs, R)
+    boot_means = W @ flat                                         # (n_boot, R)
+    mean = boot_means.mean(axis=0).reshape(samples.shape[1:])
+    std = boot_means.std(axis=0).reshape(samples.shape[1:])
+    return mean, std
+
+
 def sample_info(samples_dict: dict) -> tuple[np.ndarray, np.ndarray]:
     """Extract the sample information from a dictionary with form {bitstring: count}."""
     values = np.array([np.array([int(i) for i in bitstring]) for bitstring in samples_dict.keys()])

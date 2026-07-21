@@ -34,7 +34,7 @@ from src.extension import (linear_topology, nearest_neighbor_topology, all_to_al
 from src.utils import mutual_info_matrix, feature_distance_matrix, get_features_for_quasi_dist, array_to_str
 from src.data import BAS, JGB
 from src.setup import setup_dataloader, compute_split
-from src.plotting import _save, use_science_style, OKABE_ITO
+from src.plotting import _save, use_science_style, OKABE_ITO, SEQUENTIAL_CMAP, categorical_colors
 
 _METRIC_LABELS = {"hamming": "Hamming distance", "varinfo": "Variation of Information"}
 
@@ -92,7 +92,7 @@ def plot_bas_images(width=3, height=3, plots_dir: str = "plots", save: bool = Tr
 def plot_jgb_raw_data(N_qubits=12, N_features=3, plots_dir: str = "plots", save: bool = True):
     jgb = JGB(N_qubits, N_features)
     df0 = jgb.raw
-    colors = plt.cm.Blues(np.linspace(0.4, 1, len(df0.columns)))[::-1]
+    colors = categorical_colors(len(df0.columns))
     fig, ax = plt.subplots(1, 1, figsize=(5, 3))
     for i, c in enumerate(df0.columns):
         ax.plot(df0[c], label=f"{c[:-1]}-year Rate", color=colors[i])
@@ -106,14 +106,13 @@ def plot_jgb_raw_data(N_qubits=12, N_features=3, plots_dir: str = "plots", save:
 def plot_jgb_binary_histograms(N_qubits=12, N_features=3, plots_dir: str = "plots", save: bool = True):
     from collections import Counter
     from qiskit.visualization import plot_histogram
-    from matplotlib.colors import to_hex
     jgb = JGB(N_qubits, N_features)
     bits_per_feature = N_qubits // N_features
     target_dict = Counter(array_to_str(jgb.binary))
     feat_dicts = get_features_for_quasi_dist(target_dict, bits_per_feature, N_features)
     labels = ([f"{t}" for t in ["5-year", "10-year", "20-year"]] if N_features == 3
               else ["2-year", "5-year", "10-year", "20-year"])
-    colors = [to_hex(c) for c in plt.cm.Blues(np.linspace(0.4, 1, N_features))[::-1]]
+    colors = categorical_colors(N_features)
     fig, axs = plt.subplots(N_features, 1, figsize=(5, 5))
     for i, ax in enumerate(np.atleast_1d(axs)):
         plot_histogram(feat_dicts[i], ax=ax, bar_labels=False, color=colors[i])
@@ -137,7 +136,7 @@ def plot_threshold_curve(thresholds: np.ndarray, counts: np.ndarray, threshold: 
     threshold_idx = int(np.argmin(np.abs(thresholds - threshold)))
     threshold_count = int(counts[threshold_idx])
     fig, ax = plt.subplots(figsize=(4, 2))
-    ax.plot(thresholds, counts, color=plt.cm.Blues(0.8))
+    ax.plot(thresholds, counts, color=OKABE_ITO["blue"])
     ax.axvline(threshold, color=OKABE_ITO["vermillion"], ls="--", lw=1)
     ax.annotate(f"{rule} @ {threshold:.3f}\n({threshold_count} conn.)", xy=(threshold, threshold_count),
                xytext=(8, 4), textcoords="offset points", fontsize=7, color=OKABE_ITO["vermillion"])
@@ -158,9 +157,9 @@ def plot_extension_heatmap(distmat: np.ndarray, threshold: float, rule: str = "k
     dist_filter[distmat < threshold] = 1.0
     dist_filter -= np.eye(dim)
     fig, axs = plt.subplots(1, 2, figsize=(6, 2.6))
-    sns.heatmap(distmat, cmap="Blues", ax=axs[0], vmin=0.0, vmax=1.0)
+    sns.heatmap(distmat, cmap=SEQUENTIAL_CMAP, ax=axs[0], vmin=0.0, vmax=1.0)
     axs[0].set_title(f"a) {metric_label}")
-    sns.heatmap(dist_filter, cmap="Blues", ax=axs[1])
+    sns.heatmap(dist_filter, cmap=SEQUENTIAL_CMAP, ax=axs[1])
     axs[1].set_title(f"b) Circuit Extension ({rule}={threshold:.3f})")
     plt.tight_layout()
     if save:

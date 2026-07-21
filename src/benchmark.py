@@ -365,32 +365,47 @@ def _test_split_for_config(cfg) -> tuple:
     return {"val": c_val, "test": c_test}, valid_patterns, c_train
 
 
-def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
-                    n_shots: int = 10000, metric: str = "best_mmd_val") -> pd.DataFrame:
-    """Benchmark the best model per group of a sweep.
+def _evaluate_run(run, n_shots: int) -> dict:
+    """Load one run's best checkpoint, sample it, and evaluate the full held-out test metric suite.
 
-    For each group (value of `group_by`, a dot-separated path into the run's config, e.g.
-    "circuit.extension"), select the seed-run with the lowest validation MMD, load its best
-    checkpoint, sample it, and evaluate the full metric suite on the held-out test split. Returns a
-    tidy table with one row per group.
-
-    Runs whose logged config predates the current schema (e.g. from before a field was renamed or
-    regrouped) are skipped with a warning rather than aborting the whole benchmark.
+    Returns the flat metric dict from `evaluate` (test/mmd, test/kl, test/tv, test/fidelity, plus
+    BAS coverage/spurious_mass/gen*). Shared by benchmark_sweep (best-per-group) and
+    benchmark_all_runs (every run) so a run is scored identically regardless of caller.
     """
+    circuit, params = load_checkpoint(run)
+    cfg = from_run_config(run.config)
+    splits, valid_patterns, train_counts = _test_split_for_config(cfg)
+    samples = sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
+    return evaluate(samples, splits, cfg.data.dataset, sigmas=np.array(cfg.qcbm.sigmas),
+                    valid_patterns=valid_patterns, train_patterns=train_counts)
+
+
+def _group_runs(sweep_id: str, entity: str, project: str, group_by: str) -> dict:
+    """{group_key: [runs]} for a sweep, skipping runs whose config predates the current schema."""
     import wandb
     api = wandb.Api()
     entity = entity or api.default_entity  # unresolved None would literally build ".../None/..."
-    runs = api.sweep(f"{entity}/{project}/{sweep_id}").runs
-
     groups = {}
-    for r in runs:
+    for r in api.sweep(f"{entity}/{project}/{sweep_id}").runs:
         try:
             key = OmegaConf.select(from_run_config(r.config), group_by)
         except Exception as e:
             print(f"[benchmark]     skipping run {r.id}: config incompatible with current schema ({e})")
             continue
         groups.setdefault(key, []).append(r)
+    return groups
 
+
+def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
+                    n_shots: int = 10000, metric: str = "best_mmd_val") -> pd.DataFrame:
+    """Benchmark the best model per group of a sweep (point estimate, one row per group).
+
+    For each group (value of `group_by`, a dot-separated path into the run's config, e.g.
+    "circuit.extension"), select the seed-run with the lowest validation MMD, load its best
+    checkpoint, sample it, and evaluate the full metric suite on the held-out test split. For a
+    bootstrap over ALL runs (mean +/- std across seeds) use benchmark_all_runs instead.
+    """
+    groups = _group_runs(sweep_id, entity, project, group_by)
     rows = []
     for key, group_runs in groups.items():
         print(f"[benchmark]     [{key}] {len(group_runs)} run(s) -> selecting best by {metric}...")
@@ -399,17 +414,39 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "c
             print(f"[benchmark]     [{key}] no run with a finite {metric}, skipping.")
             continue
         print(f"[benchmark]     [{key}] best run {best.id} ({metric}={best.summary.get(metric)}); "
-              f"downloading checkpoint...")
-        circuit, params = load_checkpoint(best)
-        cfg = from_run_config(best.config)
-        splits, valid_patterns, train_counts = _test_split_for_config(cfg)
-        print(f"[benchmark]     [{key}] sampling {n_shots} shots and evaluating metrics...")
-        samples = sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
+              f"evaluating checkpoint...")
         row = {group_by: key, "run_id": best.id, "run_name": best.name,
                "best_mmd_val": best.summary.get(metric)}
-        row.update(evaluate(samples, splits, cfg.data.dataset,
-                            sigmas=np.array(cfg.qcbm.sigmas),
-                            valid_patterns=valid_patterns,
-                            train_patterns=train_counts))
+        row.update(_evaluate_run(best, n_shots))
         rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def benchmark_all_runs(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
+                       n_shots: int = 10000, metric: str = "best_mmd_val") -> pd.DataFrame:
+    """Evaluate EVERY run's best checkpoint on the held-out test split (not just the per-group best).
+
+    Returns a tidy table with ONE ROW PER RUN (group_by, run_id, run_name, best_mmd_val, + the full
+    held-out metric suite), so downstream code (plotting.bootstrap_group_metrics) can bootstrap the
+    metrics across the runs of each group -- the mean +/- across-seed standard error. Each run is
+    scored identically to benchmark_sweep (best checkpoint, same n_shots), so the per-group best row
+    of this table matches benchmark_sweep's point estimate.
+
+    Runs with an incompatible config or no usable checkpoint are skipped with a warning rather than
+    aborting the whole benchmark.
+    """
+    groups = _group_runs(sweep_id, entity, project, group_by)
+    rows = []
+    for key, group_runs in groups.items():
+        print(f"[benchmark]     [{key}] evaluating {len(group_runs)} run(s) @ {n_shots} shots...")
+        for i, r in enumerate(group_runs):
+            try:
+                metrics = _evaluate_run(r, n_shots)
+            except Exception as e:  # one bad run must not sink the whole group
+                print(f"[benchmark]     [{key}] skipping run {r.id}: {e!r}")
+                continue
+            row = {group_by: key, "run_id": r.id, "run_name": r.name,
+                   "best_mmd_val": r.summary.get(metric)}
+            row.update(metrics)
+            rows.append(row)
     return pd.DataFrame(rows)

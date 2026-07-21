@@ -25,6 +25,7 @@ from omegaconf import OmegaConf
 
 from src.data import JGB, DataLoader
 from src.config_schema import from_run_config
+from src.utils import bootstrap_mean_std
 from src import benchmark as bm
 
 
@@ -75,15 +76,27 @@ _CB_CYCLE = [OKABE_ITO["blue"], OKABE_ITO["vermillion"], OKABE_ITO["reddish_purp
             OKABE_ITO["yellow"], OKABE_ITO["orange"], OKABE_ITO["bluish_green"],
             OKABE_ITO["sky_blue"]]
 
+# shared sequential colormap for all continuous/2-D fields (heatmaps, numeric sweeps): cividis is
+# perceptually uniform AND colorblind-safe, so it pairs with the Okabe-Ito categorical palette above.
+# Imported by src.plot_extension so its figures use the same palette as this module's.
+SEQUENTIAL_CMAP = "cividis"
+
+
+def categorical_colors(n: int) -> list:
+    """`n` distinct colorblind-safe categorical colors from the shared Okabe-Ito cycle (the same
+    palette default_colors assigns to extensions), for series that aren't keyed on an extension --
+    e.g. per-feature JGB lines/histograms in src.plot_extension."""
+    return [_CB_CYCLE[i % len(_CB_CYCLE)] for i in range(n)]
+
 
 def default_colors(legend_keys) -> dict:
     """Color map preserving the v1 convention for extensions; Okabe-Ito colorblind-safe categorical
-    palette for named/extra keys, cividis (CVD-optimized sequential) for numeric sweeps."""
+    palette for named/extra keys, the shared SEQUENTIAL_CMAP (cividis) for numeric sweeps."""
     keys = list(legend_keys)
     # numeric sweep dimension -> sequential colormap ordered by value
     try:
         numeric = sorted(keys, key=lambda k: float(k))
-        shades = plt.cm.cividis(np.linspace(0.15, 0.9, len(numeric)))
+        shades = plt.get_cmap(SEQUENTIAL_CMAP)(np.linspace(0.15, 0.9, len(numeric)))
         return {k: shades[i] for i, k in enumerate(numeric)}
     except (TypeError, ValueError):
         pass
@@ -153,12 +166,18 @@ def fetch_history(run, metric: str = "mmd_train") -> pd.DataFrame:
     return df.dropna(subset=[metric]).sort_values("cumulative_measurements")
 
 
-def aggregate_over_measurements(histories: list, metric: str, mode: str = "medperc",
-                                n_grid: int = 400, window: int = 1) -> dict:
+def aggregate_over_measurements(histories: list, metric: str, mode: str = "bootstrap",
+                                n_grid: int = 400, window: int = 1, n_boot: int = 1000,
+                                boot_seed: int = 0) -> dict:
     """Interpolate each run onto a common measurement grid, then aggregate across seeds.
 
     Different legend keys have different measurements/iteration, so runs are not index-aligned; we
-    interpolate onto a shared x-grid before mean/std or median/percentile aggregation.
+    interpolate onto a shared x-grid before aggregating. `mode`:
+      - "bootstrap" (default): at each grid point, resample the runs with replacement n_boot times;
+        `line` is the mean of the bootstrap means and the band is +/- the bootstrap std of the mean
+        (the across-seed standard error), via utils.bootstrap_mean_std.
+      - "meanstd": plain across-run mean +/- std.
+      - "medperc": median with the 10th/90th percentile band.
     """
     curves = [h for h in histories if len(h) > 0]
     if not curves:
@@ -171,7 +190,10 @@ def aggregate_over_measurements(histories: list, metric: str, mode: str = "medpe
     stacked = np.vstack([
         np.interp(grid, c["cumulative_measurements"].values, c[metric].values) for c in curves
     ])
-    if mode == "meanstd":
+    if mode == "bootstrap":
+        line, std = bootstrap_mean_std(stacked, n_boot=n_boot, seed=boot_seed)  # across-run SE
+        lower, upper = line - std, line + std
+    elif mode == "meanstd":
         line = stacked.mean(axis=0)
         std = stacked.std(axis=0)
         lower, upper = line - std, line + std
@@ -182,18 +204,23 @@ def aggregate_over_measurements(histories: list, metric: str, mode: str = "medpe
     if window > 1:
         smooth = lambda a: pd.Series(a).rolling(window, min_periods=1).mean().values
         line, lower, upper = smooth(line), smooth(lower), smooth(upper)
-    return {"x": grid, "line": line, "lower": lower, "upper": upper}
+    return {"x": grid, "line": line, "lower": lower, "upper": upper, "n_runs": len(curves)}
 
 
-def plot_mmd_vs_measurements(runs_by_key: dict, metric: str = "mmd_train", mode: str = "medperc",
-                             window: int = 1, colors: dict = None, filename: str = "MMD_measurements",
-                             plots_dir: str = "plots", save: bool = True):
-    """MMD (or any logged metric) vs cumulative measurements, aggregated across seeds per group."""
+def plot_mmd_vs_measurements(runs_by_key: dict, metric: str = "mmd_train", mode: str = "bootstrap",
+                             window: int = 1, n_boot: int = 1000, colors: dict = None,
+                             filename: str = "MMD_measurements", plots_dir: str = "plots",
+                             save: bool = True):
+    """MMD (or any logged metric) vs cumulative measurements, aggregated across seeds per group.
+
+    Defaults to the bootstrap aggregation (mean +/- across-seed standard error); see
+    aggregate_over_measurements for the other modes. The shaded band is the bootstrap std of the mean.
+    """
     colors = colors or default_colors(runs_by_key.keys())
     fig, ax = plt.subplots(1, 1, figsize=(4, 3))
     for key, runs in runs_by_key.items():
         hists = [fetch_history(r, metric) for r in runs]
-        agg = aggregate_over_measurements(hists, metric, mode, window=window)
+        agg = aggregate_over_measurements(hists, metric, mode, window=window, n_boot=n_boot)
         if agg is None:
             continue
         label = _EXTENSION_LABELS.get(key, str(key))
@@ -209,16 +236,63 @@ def plot_mmd_vs_measurements(runs_by_key: dict, metric: str = "mmd_train", mode:
 
 
 # --------------------------------------------------------------------------------------------------
-# benchmark figures (best model per group)
+# benchmark figures (bootstrap across all runs per group)
 # --------------------------------------------------------------------------------------------------
+def bootstrap_group_metrics(per_run_df: pd.DataFrame, group_by: str = "circuit.extension",
+                            metric_cols: list = None, n_boot: int = 1000, seed: int = 0) -> pd.DataFrame:
+    """Bootstrap held-out benchmark metrics across the runs of each group.
+
+    `per_run_df` is the tidy one-row-per-run table from benchmark.benchmark_all_runs (a `group_by`
+    column plus numeric metric columns). For each group and metric, resample the group's runs with
+    replacement n_boot times and report the mean and the std of the bootstrap means (the across-seed
+    standard error), via utils.bootstrap_mean_std. Non-finite per-run values (e.g. gen/* for a
+    full_support run) are dropped before resampling.
+
+    Returns one row per group with, for each metric <m>, a column <m> (bootstrap mean) and <m>_std
+    (bootstrap SE), plus n_runs. Column order follows per_run_df.
+    """
+    if per_run_df is None or per_run_df.empty:
+        return None
+    if metric_cols is None:
+        skip = {group_by, "run_id", "run_name"}
+        metric_cols = [c for c in per_run_df.columns
+                       if c not in skip and np.issubdtype(per_run_df[c].dropna().dtype, np.number)]
+    rows = []
+    for key, sub in per_run_df.groupby(group_by, sort=False):
+        row = {group_by: key, "n_runs": len(sub)}
+        for c in metric_cols:
+            vals = sub[c].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                row[c] = row[f"{c}_std"] = np.nan
+            else:
+                mean, std = bootstrap_mean_std(vals, n_boot=n_boot, seed=seed)
+                row[c], row[f"{c}_std"] = float(mean), float(std)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _cell_text(row, col, precision: int) -> str:
+    """Format a benchmark-table cell as "mean ± std" when a companion <col>_std column is present
+    (bootstrap table), else just the rounded mean; an em dash for missing/NaN values."""
+    mean = row.get(col, np.nan)
+    if not np.isfinite(mean):
+        return "—"
+    std_col = f"{col}_std"
+    if std_col in row.index and np.isfinite(row.get(std_col, np.nan)):
+        return f"{mean:.{precision}f} ± {row[std_col]:.{precision}f}"
+    return f"{mean:.{precision}f}"
+
+
 def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by: str = "circuit.extension",
                       plots_dir: str = "plots", filename: str = "benchmark_table", save: bool = True,
                       precision: int = 4):
-    """Table of benchmark metrics across groups (one row per group's best model).
+    """Table of benchmark metrics across groups (one row per group).
 
-    Renders as a matplotlib table (saved as PDF/PNG, consistent with the other figures) and also
-    writes a plain CSV alongside with full float precision, since a rendered table is for reading,
-    not for downstream analysis.
+    Works for both the bootstrap table (bootstrap_group_metrics: cells shown as "mean ± std" using
+    the <metric>_std companion columns) and the point-estimate table (benchmark_sweep: bare means).
+    Renders as a matplotlib table (PDF/PNG) and writes the full-precision bench_df alongside as CSV,
+    since a rendered table is for reading, not downstream analysis.
     """
     if bench_df is None or bench_df.empty:
         return None
@@ -231,16 +305,17 @@ def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by
         return None
 
     labels = [_EXTENSION_LABELS.get(k, str(k)) for k in bench_df[group_by]]
-    display_df = bench_df[metric_cols].round(precision)
+    cell_text = [[_cell_text(row, c, precision) for c in metric_cols]
+                 for _, row in bench_df.iterrows()]
 
     if save:
         os.makedirs(plots_dir, exist_ok=True)
-        bench_df[[group_by, *metric_cols]].to_csv(f"{plots_dir}/{filename}.csv", index=False)
+        bench_df.to_csv(f"{plots_dir}/{filename}.csv", index=False)  # full table incl. *_std, n_runs
 
-    n_rows, n_cols = len(display_df), len(metric_cols)
-    fig, ax = plt.subplots(figsize=(1.4 * (n_cols + 1) + 1, 0.4 * (n_rows + 1) + 0.5))
+    n_rows, n_cols = len(cell_text), len(metric_cols)
+    fig, ax = plt.subplots(figsize=(1.7 * (n_cols + 1) + 1, 0.4 * (n_rows + 1) + 0.5))
     ax.axis("off")
-    table = ax.table(cellText=display_df.values, rowLabels=labels, colLabels=metric_cols,
+    table = ax.table(cellText=cell_text, rowLabels=labels, colLabels=metric_cols,
                      loc="center", cellLoc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(9)
@@ -285,8 +360,12 @@ def plot_generalization_bars(bench_df: pd.DataFrame, group_by: str = "circuit.ex
     fig, ax = plt.subplots(1, 1, figsize=(1.3 * n_metrics + 1.5, 3))
     for i, (k, lab) in enumerate(zip(keys, labels)):
         vals = [sub.loc[i, m] for m in metrics]
+        # bootstrap SE error bars when the <metric>_std companion columns are present
+        errs = [sub.loc[i, f"{m}_std"] if f"{m}_std" in sub.columns else np.nan for m in metrics]
+        errs = errs if np.any(np.isfinite(errs)) else None
         offset = (i - (n_groups - 1) / 2) * width
-        ax.bar(x + offset, vals, width, label=lab, color=colors.get(k))
+        ax.bar(x + offset, vals, width, label=lab, color=colors.get(k),
+               yerr=errs, capsize=2, error_kw={"lw": 0.8})
     ax.set_xticks(x)
     ax.set_xticklabels([m.split("/")[-1] for m in metrics])
     ax.set_ylabel("score")
@@ -347,11 +426,12 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
 # --------------------------------------------------------------------------------------------------
 def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: dict,
                          group_by: str = "circuit.extension", metrics=("mmd_train", "test/mmd"),
-                         plots_dir: str = "plots", science_style: bool = True):
-    """Generate the training-dependent figure set for a sweep: MMD-vs-measurements + best-model
-    benchmark (metric table, and QQ grids for JGB). Saves PDFs to plots_dir/<sweep_id>-<dataset>/,
-    so figures from different sweeps/datasets never collide or get mixed together in one flat
-    folder.
+                         plots_dir: str = "plots", science_style: bool = True, n_boot: int = 1000):
+    """Generate the training-dependent figure set for a sweep: metric-vs-measurements curves +
+    bootstrap benchmark (metric table, and QQ grids for JGB). Both the curves and the benchmark
+    aggregate ACROSS ALL SEED-RUNS of each group via bootstrap (mean +/- across-seed standard
+    error); `n_boot` sets the number of bootstrap resamples. Saves PDFs to
+    plots_dir/<sweep_id>-<dataset>/, so figures from different sweeps/datasets never collide.
 
     Static dataset/topology/threshold figures (SU(4) gate, preprocessing, threshold curve,
     extension heatmaps, topology networks) don't depend on training and are NOT generated here --
@@ -364,21 +444,26 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
 
     print(f"[plotting] sweep={sweep_id} dataset={dataset} group_by={group_by} -> {plots_dir}/")
 
-    # 1) MMD-vs-measurements over all seeds
+    # 1) metric-vs-measurements, bootstrapped over all seeds
     print("[plotting] (1/2) fetching runs from wandb...")
     grouped = fetch_runs(sweep_id, entity, project, group_by)
     n_runs = sum(len(v) for v in grouped.values())
     print(f"[plotting]     found {n_runs} runs across {len(grouped)} group(s): "
           f"{', '.join(str(k) for k in grouped)}")
     for metric in metrics:
-        print(f"[plotting]     plotting {metric} vs. measurements...")
-        plot_mmd_vs_measurements(grouped, metric=metric, filename=f"{metric}_measurements",
-                                 plots_dir=plots_dir)
+        print(f"[plotting]     plotting {metric} vs. measurements (bootstrap over seeds)...")
+        plot_mmd_vs_measurements(grouped, metric=metric, n_boot=n_boot,
+                                 filename=f"{metric}_measurements", plots_dir=plots_dir)
     print("[plotting]     done.")
 
-    # 2) best-model benchmark figures
-    print("[plotting] (2/2) benchmarking best model per group...")
-    bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by)
+    # 2) benchmark figures: evaluate every run's best checkpoint, then bootstrap across seeds
+    print("[plotting] (2/2) benchmarking all runs per group (bootstrap over seeds)...")
+    per_run = bm.benchmark_all_runs(sweep_id, entity, project, group_by)
+    bench_df = bootstrap_group_metrics(per_run, group_by=group_by, n_boot=n_boot)
+    if bench_df is None or bench_df.empty:
+        # e.g. no run had a usable checkpoint -> fall back to the best-per-group point estimate
+        print("[plotting]     no per-run metrics; falling back to best-per-group point estimate.")
+        bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by)
     plot_metric_table(bench_df, group_by=group_by, plots_dir=plots_dir)
     if dataset == "BAS":
         # Gili et al. generalization bars (no-op unless the sweep used bas_split_mode=holdout)
@@ -411,6 +496,8 @@ def _parse_args(argv=None):
                              "(default: circuit.extension; can be any swept key).")
     parser.add_argument("--metrics", nargs="+", default=["mmd_train", "test/mmd"],
                         help="Logged metrics to plot vs. cumulative measurements.")
+    parser.add_argument("--n-boot", type=int, default=1000,
+                        help="Bootstrap resamples for the across-seed mean/SE (curves + benchmark).")
     parser.add_argument("--plots-dir", default="plots", help="Output directory for the PDFs/PNGs.")
     parser.add_argument("--no-science-style", action="store_true",
                         help="Skip the scienceplots styling (use matplotlib defaults).")
@@ -430,6 +517,7 @@ def main(argv=None):
         metrics=tuple(args.metrics),
         plots_dir=args.plots_dir,
         science_style=not args.no_science_style,
+        n_boot=args.n_boot,
     )
     print(f"Figures written to {args.plots_dir}/{args.sweep_id}-{args.dataset}/")
     if bench_df is not None and not bench_df.empty:
