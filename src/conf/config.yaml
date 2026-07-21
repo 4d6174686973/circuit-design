@@ -5,8 +5,8 @@ defaults:
 
 ### Data setup (dataset-independent) ###
 data:
-  train_split: 0.7                # pct of trainset samples between 0 and 1
-  val_split: 0.15                 # pct of validation samples; test = 1 - train_split - val_split
+  train_split: 0.5                # pct of trainset samples between 0 and 1
+  val_split: 0.25                 # pct of validation samples; test = 1 - train_split - val_split
 
 ### IBM setup ###
 ibm:
