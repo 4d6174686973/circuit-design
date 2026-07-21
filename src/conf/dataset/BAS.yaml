@@ -5,6 +5,6 @@ data:
   width: 3                        # width of the BAS image
   height: 3                       # height of the BAS image
   N_qubits: 9                     # width * height
-  bas_split_mode: full_support    # full_support (all patterns in every split) or holdout (seeded disjoint partition)
+  bas_split_mode: holdout    # full_support (all patterns in every split) or holdout (seeded disjoint partition)
 circuit:
   extension_metric: hamming       # hamming, varinfo
