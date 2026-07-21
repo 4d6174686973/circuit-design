@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from hydra.core.config_store import ConfigStore
+from omegaconf import DictConfig, OmegaConf
 
 
 @dataclass
@@ -79,9 +80,18 @@ class SweepConfig:
     # initial_random_seed is the ONLY seed you set. runs_batch_size auto-seeded runs are spawned per
     # hydra job, each derived as initial_random_seed + i (i = 0 .. runs_batch_size-1) and logged as
     # the run's effective seed.
-    runs_batch_size: int = 1               # number of auto-seeded training runs to run in parallel per hydra job
+    runs_batch_size: int = 1               # number of auto-seeded training runs per hydra job (seeds)
     initial_random_seed: int = 42          # base seed; run i in a batch uses initial_random_seed + i
     gpus_per_node: int = 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
+
+    # CPU parallelism budget for the whole sweep. All (grid combo x seed) runs share one global
+    # process pool sized by these, so the entire --multirun runs concurrently up to the hardware
+    # limit -- not one grid combo at a time. Both default to 0 = auto: max_parallel_runs is then
+    # min(total_runs, n_cpus) and threads_per_run is n_cpus // max_parallel_runs, so few runs each
+    # get many threads (fast sampling) and many runs trade threads for run-level parallelism.
+    # See src/setup.py::plan_resources.
+    max_parallel_runs: int = 0             # concurrent training runs across the whole sweep (0 = auto)
+    threads_per_run: int = 0               # OMP/BLAS/Aer/gradient threads per run (0 = auto, resolved at runtime)
 
     # Effective per-run seed, derived from initial_random_seed + batch index and assigned before
     # training starts (see src/__main__.py::pretrain_mps, src/setup.py::train_worker) -- never read
@@ -110,3 +120,14 @@ class Config:
 
 cs = ConfigStore.instance()
 cs.store(name="config_schema", node=Config)
+
+
+def from_run_config(config: dict) -> DictConfig:
+    """Wrap a wandb run's logged config dict (from src.setup._init_wandb, itself
+    OmegaConf.to_container(cfg, resolve=True)) back into this schema, so callers get the same dot
+    access (cfg.data.dataset) and validation as a live Hydra run, instead of dict indexing.
+
+    wandb's public API already strips its own internal keys (_wandb, wandb_version) from
+    Run.config, so this only ever sees the fields we logged ourselves.
+    """
+    return OmegaConf.merge(OmegaConf.structured(Config), config)

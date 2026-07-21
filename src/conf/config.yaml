@@ -52,9 +52,14 @@ qcbm:
 # hydra job, each derived as initial_random_seed + i (i = 0 .. runs_batch_size-1) and logged as the
 # run's effective seed -- there is no separate "random_seed" to set or accidentally collide on.
 sweep:
-  runs_batch_size: 1               # number of auto-seeded training runs to run in parallel per hydra job
+  runs_batch_size: 1               # number of auto-seeded training runs per hydra job (seeds)
   initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
   gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
+  # CPU parallelism budget shared across the WHOLE --multirun (all grid combos x seeds run at once,
+  # not one combo at a time). Both 0 = auto: max_parallel_runs = min(total_runs, n_cpus),
+  # threads_per_run = n_cpus // max_parallel_runs. See src/setup.py::plan_resources.
+  max_parallel_runs: 0             # concurrent training runs across the whole sweep (0 = auto)
+  threads_per_run: 0               # OMP/BLAS/Aer/gradient threads per run (0 = auto)
 
 ### Logging ###
 logging:

@@ -18,11 +18,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
+from omegaconf import OmegaConf
 
 from src.extension import (add_su4_gate, linear_topology, nearest_neighbor_topology,
                            all_to_all_topology, metric_based_topology)
 from src.data import BAS, JGB, DataLoader, init_qubit_order_bas
-from src.utils import varInfoMat, get_features_for_quasi_dist, array_to_str, get_nested
+from src.utils import varInfoMat, get_features_for_quasi_dist, array_to_str
+from src.config_schema import from_run_config
 from src import benchmark as bm
 
 
@@ -86,20 +88,28 @@ def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "circui
                filters: dict = None) -> dict:
     """Return {legend_key: [runs]} for a real wandb Sweep, grouped by a config dimension.
 
-    group_by and filters keys are dot-separated paths into the run's nested config, e.g.
-    "circuit.extension". filters is an optional {config_key: value} dict to pin non-legend swept
-    params (facet slicing), applied client-side since Sweep.runs is a materialized list, not a
-    server-side query.
+    group_by and filters keys are dot-separated paths into the run's config, e.g. "circuit.extension".
+    filters is an optional {config_key: value} dict to pin non-legend swept params (facet slicing),
+    applied client-side since Sweep.runs is a materialized list, not a server-side query.
+
+    Runs whose logged config predates the current schema (e.g. from before a field was renamed or
+    regrouped) are skipped with a warning rather than aborting the whole fetch.
     """
     import wandb
     api = wandb.Api()
     entity = entity or api.default_entity  # unresolved None would literally build ".../None/..."
-    runs = list(api.sweep(f"{entity}/{project}/{sweep_id}").runs)
+    runs = []
+    for r in api.sweep(f"{entity}/{project}/{sweep_id}").runs:
+        try:
+            runs.append((r, from_run_config(r.config)))
+        except Exception as e:
+            print(f"[plotting]     skipping run {r.id}: config incompatible with current schema ({e})")
     if filters:
-        runs = [r for r in runs if all(get_nested(r.config, k) == v for k, v in filters.items())]
+        runs = [(r, cfg) for r, cfg in runs
+                if all(OmegaConf.select(cfg, k) == v for k, v in filters.items())]
     grouped = {}
-    for r in runs:
-        grouped.setdefault(get_nested(r.config, group_by), []).append(r)
+    for r, cfg in runs:
+        grouped.setdefault(OmegaConf.select(cfg, group_by), []).append(r)
     return grouped
 
 
@@ -109,9 +119,10 @@ def fetch_history(run, metric: str = "mmd_train") -> pd.DataFrame:
     df = run.history(keys=keys, pandas=True)
     if df is None or df.empty or metric not in df:
         # fallback: reconstruct measurements from config if not logged
-        n = get_nested(run.config, "qcbm.iterations", 0)
+        cfg = from_run_config(run.config)
+        n = cfg.qcbm.iterations
         P = run.summary.get("num_parameters") or run.config.get("num_parameters", 0)
-        shots = get_nested(run.config, "qcbm.N_shots", 0)
+        shots = cfg.qcbm.N_shots
         per = (2 * P + 1) * shots
         df = pd.DataFrame({"cumulative_measurements": np.arange(1, n + 1) * per,
                            metric: [np.nan] * n})
@@ -398,20 +409,22 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
     figs = {}
     for key, runs in grouped.items():
         best = bm.select_best_run(runs)
-        if best is None or get_nested(best.config, "data.dataset") != "JGB":
+        if best is None:
+            continue
+        cfg = from_run_config(best.config)
+        if cfg.data.dataset != "JGB":
             continue
         print(f"[plotting]     [{key}] QQ plots from best run {best.id}...")
         circuit, params = bm.load_checkpoint(best)
-        samples = bm.sample_model(circuit, params, n_shots, seed=get_nested(best.config, "sweep.random_seed", 0))
-        splits, _ = bm._test_split_for_config(best.config)
-        cfg = best.config["data"]
-        jgb = JGB(cfg["N_qubits"], cfg["N_features"]); dl = DataLoader(jgb)
-        dl.train_val_test_split(cfg["train_split"], cfg["val_split"])
+        samples = bm.sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
+        splits, _ = bm._test_split_for_config(cfg)
+        jgb = JGB(cfg.data.N_qubits, cfg.data.N_features); dl = DataLoader(jgb)
+        dl.train_val_test_split(cfg.data.train_split, cfg.data.val_split)
         xmin, xmax = dl.conv_min_max
         bpf = jgb.bits_per_feature
-        feats = bm.reconstruct_features(samples, bpf, cfg["N_features"], xmin, xmax)
+        feats = bm.reconstruct_features(samples, bpf, cfg.data.N_features, xmin, xmax)
         data = jgb.decimal.values
-        fig, axs = plt.subplots(1, cfg["N_features"], figsize=(3 * cfg["N_features"], 3))
+        fig, axs = plt.subplots(1, cfg.data.N_features, figsize=(3 * cfg.data.N_features, 3))
         for i, ax in enumerate(np.atleast_1d(axs)):
             mv, mp = feats[i]
             dx, my = bm.qq_model_vs_data(mv, mp, data[:, i], n_q)

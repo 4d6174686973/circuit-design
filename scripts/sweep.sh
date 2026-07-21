@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# QCBM sweep across one or more nodes (SLURM array job).
+# QCBM sweep across one or more nodes (SLURM array job). CPU-parallel (see GPU note at the bottom).
 #
 # Unlike a wandb-agent-driven sweep, the search grid here is owned by Hydra
 # (--multirun key=v1,v2,...), not by wandb -- wandb is used purely for tracking/organizing (a
 # real Sweep object is created and every run attaches to it, see src/setup.py::get_or_create_wandb_sweep).
-# Within each array task (= 1 node), the Python entrypoint itself fans out `runs_batch_size`
-# auto-seeded runs in parallel (one process per seed, optionally one GPU each) -- no wandb agent,
-# no submitit. Across array tasks (nodes), work is split by SEED RANGE (see below), so the full
-# Hydra grid runs identically-but-disjointly on every node with no duplicated work and no manual
-# override-splitting.
+# Within each array task (= 1 node), the Python entrypoint runs the ENTIRE local grid concurrently:
+# all (grid combo x seed) runs share one process pool sized to the node's CPUs, so a whole
+# --multirun saturates the node instead of running one combo at a time. Thread/parallelism budget is
+# auto-derived from the core count (MAX_PARALLEL_RUNS x THREADS_PER_RUN ~= cores); override below.
+# No wandb agent, no submitit. Across array tasks (nodes), work is split by SEED RANGE (see below),
+# so the full Hydra grid runs identically-but-disjointly on every node with no duplicated work.
 #
 # Usage:
 #   sbatch [--array=0-N] scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'
@@ -19,6 +20,9 @@
 #   sbatch scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'                  # 1 node
 #   sbatch --array=0-3 scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'      # 4 nodes,
 #       # each running the SAME grid but with a disjoint block of seeds (see NODE_INITIAL_SEED below)
+#   RUNS_BATCH_SIZE=5 scripts/sweep.sh 'circuit.extension=none,metric_based circuit.extension_threshhold=0.3,0.5'
+#       # 2 x 2 combos x 5 seeds = 20 runs, all parallel on this node (auto thread budget)
+#   THREADS_PER_RUN=4 scripts/sweep.sh 'circuit.extension=none,metric_based'   # force 4 threads/run
 #
 # NOTE (SLURM): --output/--error directories must already exist before you `sbatch` this script --
 # SLURM creates the log FILE but not its parent directory, and the job fails immediately (with no
@@ -72,10 +76,17 @@ N_QUBITS="${N_QUBITS:-9}"
 RUNS_BATCH_SIZE="${RUNS_BATCH_SIZE:-5}"
 BASE_SEED="${INIT_SEED:-42}"
 SIMULATOR="${SIMULATOR:-aer_statevec_cpu}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-0}"          # >0 pins batch runs round-robin across GPUs (see README:
-                                              # GPU is only worthwhile at high qubit counts; leave 0
-                                              # for the 9-12 qubit sweeps this repo targets by default)
 WANDB_MODE="${WANDB_MODE:-online}"
+
+# CPU parallelism budget (0 = auto from the node's core count; see src/setup.py::plan_resources).
+# Leave both 0 to saturate the node: the planner picks MAX_PARALLEL_RUNS concurrent runs each with
+# THREADS_PER_RUN threads so their product ~= cores. Set one to steer the run-vs-thread trade-off.
+MAX_PARALLEL_RUNS="${MAX_PARALLEL_RUNS:-0}"
+THREADS_PER_RUN="${THREADS_PER_RUN:-0}"
+
+# GPU note: this launcher targets CPU. GPU_PER_NODE stays 0 -- GPU scheduling is future work (see
+# the GPU section in the README and the "GPU NOTE" markers in src/setup.py / src/__main__.py).
+GPUS_PER_NODE="${GPUS_PER_NODE:-0}"
 
 # --- Cross-node work split: disjoint seed ranges, not manual override-splitting ---
 # Every node runs the IDENTICAL Hydra grid (${OVERRIDES}), but each array task gets its own block of
@@ -112,9 +123,10 @@ if [ "$WANDB_MODE" == "online" ] && [ "$TASK_COUNT" -gt 1 ]; then
     fi
 fi
 
-echo ">>> [Run] Node: $(hostname) | task ${TASK_ID}/${TASK_COUNT}"
+echo ">>> [Run] Node: $(hostname) | task ${TASK_ID}/${TASK_COUNT} | cpus=$(nproc 2>/dev/null || echo '?')"
 echo ">>> [Run] Sweeping: ${OVERRIDES}"
-echo ">>> [Run] dataset=${DATASET} N_qubits=${N_QUBITS} runs_batch_size=${RUNS_BATCH_SIZE} initial_random_seed=${NODE_INITIAL_SEED} simulator=${SIMULATOR} gpus_per_node=${GPUS_PER_NODE} wandb_mode=${WANDB_MODE}"
+echo ">>> [Run] dataset=${DATASET} N_qubits=${N_QUBITS} runs_batch_size=${RUNS_BATCH_SIZE} initial_random_seed=${NODE_INITIAL_SEED} simulator=${SIMULATOR} wandb_mode=${WANDB_MODE}"
+echo ">>> [Run] max_parallel_runs=${MAX_PARALLEL_RUNS} threads_per_run=${THREADS_PER_RUN} (0 = auto from cores)"
 echo ">>> [Run] WANDB_SWEEP_ID=${WANDB_SWEEP_ID:-<created by this node>}"
 
 uv run --no-sync python -m src --multirun \
@@ -123,8 +135,32 @@ uv run --no-sync python -m src --multirun \
     data.N_qubits="${N_QUBITS}" \
     sweep.runs_batch_size="${RUNS_BATCH_SIZE}" \
     sweep.initial_random_seed="${NODE_INITIAL_SEED}" \
+    sweep.max_parallel_runs="${MAX_PARALLEL_RUNS}" \
+    sweep.threads_per_run="${THREADS_PER_RUN}" \
     ibm.simulator="${SIMULATOR}" \
     sweep.gpus_per_node="${GPUS_PER_NODE}" \
     logging.wandb_mode="${WANDB_MODE}"
 
 echo ">>> [Run] Task ${TASK_ID} finished successfully."
+
+# ==============================================================================
+# GPU support -- FUTURE WORK (this launcher is CPU-only)
+# ==============================================================================
+# The current implementation is tuned for CPU: each run is many small numpy/scipy ops (kernel,
+# gradient, Adam) plus one heavier Aer statevector sampling step, and throughput comes from running
+# MANY runs in parallel with a few threads each. A GPU is only worthwhile at higher qubit counts,
+# and a naive "sampling on GPU, everything else on CPU" hybrid is dominated by per-iteration
+# CPU<->GPU transfers. Making GPUs pay off is a non-trivial change; when tackling it, touch:
+#
+#   * src/setup.py::plan_resources    -- branch on cfg.sweep.gpus_per_node: size the pool to GPUs
+#                                        (~1 run/GPU, bounded by VRAM) instead of CPU cores.
+#   * src/setup.py::train_worker      -- CUDA_VISIBLE_DEVICES pinning is already stubbed; skip the
+#                                        CPU thread-capping for GPU runs.
+#   * src/setup.py::setup_qiskit_simulator -- device="GPU" path exists (batched_shots_gpu, blocking);
+#                                        verify blocking_qubits/VRAM sizing for the target GPUs.
+#   * src/cost.py, src/qcbm.py        -- to avoid transfer overhead, move the per-iteration kernel/
+#                                        gradient math onto the GPU (e.g. cupy) so a run stays
+#                                        device-resident across the whole iteration, not just sampling.
+#   * this script                     -- add #SBATCH --gres=gpu:N, set GPUS_PER_NODE=N, and expose a
+#                                        GPU simulator via SIMULATOR=aer_statevec_gpu.
+# The "GPU NOTE" comments in the Python sources mark each of these swap points inline.

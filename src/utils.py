@@ -1,19 +1,6 @@
 import numpy as np
 import pandas as pd
 
-def get_nested(d: dict, dotted_key: str, default=None):
-    """Look up a dot-separated key path in a nested dict, e.g. get_nested(cfg, "circuit.extension").
-
-    Used for reading wandb run configs, which mirror the hierarchical Hydra config groups (data,
-    ibm, aer, mps, circuit, qcbm, sweep, logging) as nested dicts rather than flat keys.
-    """
-    node = d
-    for part in dotted_key.split("."):
-        if not isinstance(node, dict) or part not in node:
-            return default
-        node = node[part]
-    return node
-
 def sample_info(samples_dict: dict) -> tuple[np.ndarray, np.ndarray]:
     """Extract the sample information from a dictionary with form {bitstring: count}."""
     values = np.array([np.array([int(i) for i in bitstring]) for bitstring in samples_dict.keys()])

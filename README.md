@@ -56,23 +56,44 @@ every field above; composing an unknown key or a wrongly-typed override fails fa
 instead of surfacing as a runtime `AttributeError`.
 
 ## Multirun
-Running multiple simulations sequentially based on same config file but changing config parameters e.g. the extension method
+Running multiple simulations based on the same config file but changing config parameters, e.g. the
+extension method (and any other field — thresholds, cutoffs, ...):
 ```sh
 uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all
 ```
-Results will be saved in `multirun/`
+Results will be saved in `multirun/`.
 
 ## Parallel seeds (batching)
 For each hyperparameter combination (e.g. each `circuit.extension` above), you can run several repeats
-with different random seeds in parallel. You only ever set `sweep.initial_random_seed`; the
-`sweep.runs_batch_size` parallel repeats are auto-seeded as `initial_random_seed + i` and logged
+with different random seeds. You only ever set `sweep.initial_random_seed`; the
+`sweep.runs_batch_size` repeats are auto-seeded as `initial_random_seed + i` and logged
 individually — there is no separate seed parameter to set per run, so runs can't accidentally
 collide on the same seed.
 ```sh
 uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all \
     sweep.runs_batch_size=5 sweep.initial_random_seed=42
 ```
-This runs 3 extensions x 5 seeds (42-46) = 15 trainings, 5 running in parallel at a time.
+
+## Parallelism (CPU)
+The **entire** sweep — every `(grid combo × seed)` run — is executed concurrently through a single
+process pool sized to the machine, not one grid combo at a time. For the example above (3 extensions
+× 5 seeds = 15 runs) all 15 are scheduled at once, capped only by the hardware.
+
+The CPU budget is auto-derived and needs no tuning: `sweep.max_parallel_runs` concurrent runs, each
+with `sweep.threads_per_run` BLAS/OpenMP/Aer/gradient threads, chosen so their product ≈ the node's
+core count. Both default to `0` (auto): a small sweep gives each run many threads (faster Aer
+sampling), a large sweep trades threads for more concurrent runs — always using ~all cores. Override
+either to steer the trade-off (the other is derived to fill the cores):
+```sh
+# force 4 threads per run (concurrency = cores // 4); or cap concurrent runs directly:
+uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all \
+    sweep.runs_batch_size=5 sweep.threads_per_run=4
+uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all \
+    sweep.runs_batch_size=5 sweep.max_parallel_runs=16
+```
+This design is CPU-oriented (each run is many small numpy ops plus one Aer sampling step, so
+run-level parallelism scales better than threads-per-run). GPU scheduling is deliberately left as
+**future work** — see the *GPU (future work)* note below.
 
 ## Experiment tracking (wandb)
 
@@ -92,10 +113,31 @@ uv run python -m src --multirun circuit.extension=none,metric_based,all_to_all l
 ```
 Project/entity are set via `logging.wandb_project` / `logging.wandb_entity` in the config (or as CLI overrides).
 
+To keep per-run overhead low at high parallelism, each wandb run disables its background
+system-metrics monitor and metadata/git/code scanning (only the training metrics we explicitly log
+are kept) — otherwise every one of the dozens of concurrent runs would spawn its own polling thread
+and periodic uploads.
+
 For a cluster/SLURM launch (multi-node, proper resource requests, automatic disjoint seed-sharding
 across nodes, and leader/worker synchronization so every node's runs join the *same* sweep), use
 `scripts/sweep.sh` instead of invoking `python -m src` directly — see the comments at the top of
 that file for `sbatch`/multi-node usage.
+
+## GPU (future work)
+This project currently runs on **CPU only**. Each training run is dominated by many small numpy/scipy
+operations (kernel, gradient, Adam) with a single heavier Aer statevector *sampling* step, so on the
+9–12 qubit problems here throughput comes from running many CPU runs in parallel (above), and a GPU
+helps only at higher qubit counts. A naive "sample on GPU, everything else on CPU" hybrid is
+dominated by per-iteration CPU↔GPU transfers, so making GPUs pay off is a larger change, left as
+future work. The swap points are marked with `GPU NOTE` comments in the code:
+- `src/setup.py::plan_resources` — size the pool to GPU count/VRAM instead of CPU cores.
+- `src/setup.py::train_worker` — GPU pinning (`CUDA_VISIBLE_DEVICES`) is stubbed via
+  `sweep.gpus_per_node`; skip CPU thread-capping for GPU runs.
+- `src/setup.py::setup_qiskit_simulator` — the `device="GPU"` path (`batched_shots_gpu`, multi-GPU
+  `blocking`) already exists; verify VRAM/blocking sizing for the target GPUs.
+- `src/cost.py`, `src/qcbm.py` — move the per-iteration kernel/gradient math onto the GPU (e.g.
+  `cupy`) so a run stays device-resident across the whole iteration, not just during sampling.
+- `scripts/sweep.sh` — add `#SBATCH --gres=gpu:N`, set `GPUS_PER_NODE=N`, `SIMULATOR=aer_statevec_gpu`.
 
 Once a sweep has runs, regenerate all figures (including the paper's dataset/topology plots, MMD
 over cumulative measurements, and best-model QQ/benchmark plots) as PDF:

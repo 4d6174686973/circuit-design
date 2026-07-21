@@ -53,6 +53,13 @@ def setup_qiskit_simulator(cfg: DictConfig) -> tuple:
             "max_parallel_shots": cfg.aer.aer_max_parallel_shots,
             "seed_simulator": cfg.sweep.random_seed,
         }
+        # Cap Aer's OpenMP pool to this run's thread budget so W parallel runs don't each grab all
+        # cores (oversubscription). threads_per_run is resolved per-run by __main__/train_worker;
+        # 0 (a bare single run that never went through the planner) leaves Aer's default (all cores).
+        # GPU NOTE: on device="GPU" this CPU cap is irrelevant -- the heavy work runs on-device.
+        threads_per_run = int(cfg.sweep.threads_per_run or 0)
+        if device == "CPU" and threads_per_run > 0:
+            backend_options["max_parallel_threads"] = threads_per_run
         if device == "GPU":
             backend_options["batched_shots_gpu"] = True
             backend_options["batched_shots_gpu_max_qubits"] = cfg.aer.aer_batched_shots_gpu_max_qubits
@@ -268,17 +275,14 @@ def _coerce(value: str):
     return value
 
 
-def build_sweep_config(cfg: DictConfig) -> dict:
-    """Build a wandb sweep_config describing the actual search space of this invocation.
+def _grid_value_lists() -> dict:
+    """Parse the Hydra multirun grid from sys.argv into {key: [values]}.
 
-    The real grid is owned by Hydra (--multirun key=v1,v2,...), not wandb's own search engine, so
-    this only DOCUMENTS that grid for the wandb Sweep object/UI (parallel-coordinates, filtering) —
-    it is never used to drive execution. Detected from sys.argv: any `key=v1,v2,...` override
-    (Hydra's multirun list syntax) becomes a swept parameter; `key=[1,2]` (a literal list value,
-    e.g. sigmas) is left alone. The per-seed `random_seed` values (derived from
-    initial_random_seed + runs_batch_size, not a literal CLI override) are added explicitly.
+    Detects `key=v1,v2,...` (Hydra's multirun list syntax); a `key=[1,2]` literal list value
+    (e.g. sigmas) is left out, since that is one value, not a sweep axis. Shared by
+    build_sweep_config (for the wandb Sweep object) and count_grid_combos (for resource planning).
     """
-    parameters = {}
+    grid = {}
     for arg in sys.argv[1:]:
         if arg.startswith("-") or "=" not in arg:
             continue
@@ -286,12 +290,95 @@ def build_sweep_config(cfg: DictConfig) -> dict:
         if value.startswith("[") and value.endswith("]"):
             continue  # a literal list value (e.g. sigmas=[1.0]), not a multirun sweep list
         if "," in value:
-            parameters[key] = {"values": [_coerce(v) for v in value.split(",")]}
+            grid[key] = value.split(",")
+    return grid
+
+
+def count_grid_combos() -> int:
+    """Number of Hydra multirun grid combinations in this invocation (product of axis lengths)."""
+    combos = 1
+    for values in _grid_value_lists().values():
+        combos *= len(values)
+    return combos
+
+
+def build_sweep_config(cfg: DictConfig) -> dict:
+    """Build a wandb sweep_config describing the actual search space of this invocation.
+
+    The real grid is owned by Hydra (--multirun key=v1,v2,...), not wandb's own search engine, so
+    this only DOCUMENTS that grid for the wandb Sweep object/UI (parallel-coordinates, filtering) —
+    it is never used to drive execution. The per-seed `random_seed` values (derived from
+    initial_random_seed + runs_batch_size, not a literal CLI override) are added explicitly.
+    """
+    parameters = {key: {"values": [_coerce(v) for v in values]}
+                  for key, values in _grid_value_lists().items()}
 
     seeds = [cfg.sweep.initial_random_seed + i for i in range(cfg.sweep.runs_batch_size)]
     parameters["random_seed"] = {"values": seeds}
 
     return {"method": "grid", "parameters": parameters}
+
+
+# --------------------------------------------------------------------------------------------------
+# CPU resource planning for the whole sweep
+#
+# GPU NOTE (future work): everything below plans a *CPU* budget -- it splits cores across many
+# concurrent CPU-bound runs. A GPU-efficient mode would be a different split (≈1 run per GPU, pinned
+# via CUDA_VISIBLE_DEVICES, with each run's Aer on device="GPU"), and would also want the many small
+# per-iteration numpy ops (kernel/gradient in src/cost.py, src/qcbm.py) moved onto the GPU (e.g.
+# cupy) to avoid a CPU<->GPU round-trip every iteration -- otherwise the hybrid is dominated by
+# transfer overhead. The swap points are marked "GPU NOTE" across plan_resources (below),
+# apply_thread_env (below), train_worker / setup_qiskit_simulator, and __main__'s pool sizing.
+# --------------------------------------------------------------------------------------------------
+_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+
+
+def available_cpus() -> int:
+    """Logical CPUs usable by this process, honoring SLURM/cgroup pinning where possible."""
+    try:
+        return len(os.sched_getaffinity(0))  # respects cpuset/SLURM --cpus-per-task on Linux
+    except AttributeError:
+        return os.cpu_count() or 1            # macOS / Windows fallback
+
+
+def plan_resources(cfg: DictConfig) -> tuple:
+    """Resolve (max_parallel_runs, threads_per_run) for the whole sweep from config + hardware.
+
+    total_runs = (grid combos) x runs_batch_size. Precedence:
+      - both configured (>0): used as-is (may intentionally over/undersubscribe).
+      - only max_parallel_runs set: threads_per_run = cores // max_parallel_runs.
+      - only threads_per_run set: max_parallel_runs = min(total_runs, cores // threads_per_run).
+      - neither: max_parallel_runs = min(total_runs, cores); threads_per_run = cores // that.
+    So a small sweep gives each run many threads (fast Aer sampling), while a large sweep trades
+    threads for run-level parallelism -- always using ~all cores.
+
+    GPU NOTE: for a GPU run this whole calculation changes (parallelism is bounded by GPU count/VRAM,
+    not CPU cores); branch here on cfg.sweep.gpus_per_node when GPU support lands.
+    """
+    n_cpus = available_cpus()
+    total_runs = max(1, count_grid_combos() * max(1, int(cfg.sweep.runs_batch_size)))
+    mpr = int(cfg.sweep.max_parallel_runs or 0)
+    tpr = int(cfg.sweep.threads_per_run or 0)
+
+    if mpr <= 0:
+        mpr = min(total_runs, n_cpus // tpr) if tpr > 0 else min(total_runs, n_cpus)
+        mpr = max(1, mpr)
+    if tpr <= 0:
+        tpr = max(1, n_cpus // mpr)
+    return mpr, tpr
+
+
+def apply_thread_env(threads_per_run: int) -> None:
+    """Cap BLAS/OpenMP threads per run via environment variables.
+
+    Set in the PARENT before the spawn pool is created so each fresh worker inherits it *before* it
+    imports numpy/scipy/Aer, which is the only reliable moment to size those libraries' thread pools
+    (setting it after import is a no-op for already-initialized pools). With W parallel runs each
+    capped at threads_per_run, total threads stay ~= cores instead of W*cores (oversubscription).
+    """
+    for var in _THREAD_ENV_VARS:
+        os.environ[var] = str(max(1, int(threads_per_run)))
 
 
 def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
@@ -352,6 +439,17 @@ def _init_wandb(cfg: DictConfig, group: str, sweep_id: str):
     """
     import wandb
     entity = cfg.logging.wandb_entity
+    # Overhead control: with many parallel runs, wandb's per-run background system-stats monitor
+    # (a thread polling CPU/mem every few seconds + periodic network posts) and metadata/code/git
+    # scans add up to N times the cost for no benefit here -- we only log our own scalar metrics.
+    # Disable them. Kept: the actual metric logging (one buffered, non-blocking log() per iteration).
+    settings = wandb.Settings(
+        sweep_id=sweep_id,
+        x_disable_stats=True,        # no per-run system-metrics monitor thread / posts
+        x_disable_meta=True,         # skip machine/git/code metadata collection at init
+        disable_git=True,
+        disable_code=True,
+    )
     return wandb.init(
         project=cfg.logging.wandb_project,
         entity=entity if entity else None,
@@ -361,7 +459,7 @@ def _init_wandb(cfg: DictConfig, group: str, sweep_id: str):
         job_type="train",
         config=OmegaConf.to_container(cfg, resolve=True),
         mode=cfg.logging.wandb_mode,
-        settings=wandb.Settings(sweep_id=sweep_id),
+        settings=settings,
         reinit=True,
     )
 
@@ -411,19 +509,28 @@ def train_worker(cfg_container: dict, seed: int, worker_index: int, group: str, 
 
     Pins per-worker resources (GPU / threads), sets the run's seed, then trains one QCBM. Defined
     here (not in __main__) so spawned child processes can import it.
+
+    Thread budget: cfg.sweep.threads_per_run is resolved by __main__ (plan_resources) and the same
+    value is exported to the environment there before the pool is spawned, so a fresh worker's BLAS
+    already inits at the right size. We re-assert the env here (harmless, and covers a direct
+    non-pooled call), cap Aer's own thread pool via cfg.sweep.threads_per_run
+    (see setup_qiskit_simulator), and size the gradient ThreadPoolExecutor to match.
     """
     _configure_worker_logging(output_dir, seed)
 
     cfg = OmegaConf.create(cfg_container)
     cfg.sweep.random_seed = seed
 
+    # GPU NOTE: round-robin GPU pinning is stubbed here; CPU sweeps leave gpus_per_node=0. A real
+    # GPU mode would also skip the CPU thread-capping below (a GPU run wants full BLAS for its host
+    # side, and its heavy work is on-device).
     n_gpus = int(cfg.sweep.gpus_per_node or 0)
     if n_gpus > 0:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_index % n_gpus)
 
-    workers = max(1, int(cfg.sweep.runs_batch_size))
-    n_cpu = os.cpu_count() or 1
-    os.environ.setdefault("OMP_NUM_THREADS", str(max(1, n_cpu // workers)))
+    threads_per_run = max(1, int(cfg.sweep.threads_per_run or 1))
+    apply_thread_env(threads_per_run)
+    cfg.aer.gradient_workers = threads_per_run  # per-parameter gradient ThreadPoolExecutor size
 
     setup_and_train_qcbm(cfg, group=group, output_dir=output_dir)
 
