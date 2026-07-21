@@ -39,8 +39,11 @@ set -euo pipefail
 
 OVERRIDES="${1:?Provide a Hydra multirun override string, e.g. 'extension=none,metric_based'}"
 
-# Run from the repo root regardless of where this was submitted/invoked from.
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# Run from the repo root regardless of where this was submitted/invoked from. Under sbatch, the
+# script runs from a spooled copy on the compute node, so BASH_SOURCE doesn't point at the repo --
+# use SLURM_SUBMIT_DIR (always set by sbatch, = the directory `sbatch` was run from) instead, and
+# fall back to BASH_SOURCE only for local (non-sbatch) runs.
+cd "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}"
 
 # uv is often installed outside the default SLURM job PATH -- fail fast with a clear error instead
 # of a cryptic "command not found" buried in a log, rather than silently doing nothing.
