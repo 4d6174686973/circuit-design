@@ -121,7 +121,12 @@ and periodic uploads.
 For a cluster/SLURM launch (multi-node, proper resource requests, automatic disjoint seed-sharding
 across nodes, and leader/worker synchronization so every node's runs join the *same* sweep), use
 `scripts/sweep.sh` instead of invoking `python -m src` directly — see the comments at the top of
-that file for `sbatch`/multi-node usage.
+that file for `sbatch`/multi-node usage. `--array`/`--nodelist` are plain `sbatch` flags, so picking
+specific nodes needs no script changes, e.g. two named nodes (used here for their CPUs only — this
+launcher is CPU-only, see below — even if the nodes happen to also have GPUs):
+```sh
+sbatch --array=0-1 --nodelist=pgi14-gpu7,pgi14-gpu8 scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'
+```
 
 ## GPU (future work)
 This project currently runs on **CPU only**. Each training run is dominated by many small numpy/scipy

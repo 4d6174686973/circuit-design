@@ -1,46 +1,38 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# QCBM sweep across one or more nodes (SLURM array job). CPU-parallel (see GPU note at the bottom).
+# QCBM sweep across one or more nodes (SLURM array job). CPU-only (GPU is future work, see bottom).
 #
-# Unlike a wandb-agent-driven sweep, the search grid here is owned by Hydra
-# (--multirun key=v1,v2,...), not by wandb -- wandb is used purely for tracking/organizing (a
-# real Sweep object is created and every run attaches to it, see src/setup.py::get_or_create_wandb_sweep).
-# Within each array task (= 1 node), the Python entrypoint runs the ENTIRE local grid concurrently:
-# all (grid combo x seed) runs share one process pool sized to the node's CPUs, so a whole
-# --multirun saturates the node instead of running one combo at a time. Thread/parallelism budget is
-# auto-derived from the core count (MAX_PARALLEL_RUNS x THREADS_PER_RUN ~= cores); override below.
-# No wandb agent, no submitit. Across array tasks (nodes), work is split by SEED RANGE (see below),
-# so the full Hydra grid runs identically-but-disjointly on every node with no duplicated work.
+# The Hydra grid (--multirun key=v1,v2,...) is what's swept, not wandb (no wandb agent). Each array
+# task (= 1 node) runs its ENTIRE local grid concurrently in one process pool sized to the node's
+# CPUs (MAX_PARALLEL_RUNS x THREADS_PER_RUN below), instead of one combo at a time. Across array
+# tasks, work is split by disjoint seed ranges (NODE_INITIAL_SEED below), so every node runs the
+# same grid without duplicating work.
 #
 # Usage:
-#   sbatch [--array=0-N] scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'
-#   bash scripts/sweep.sh 'circuit.extension=metric_based circuit.extension_threshhold=0.3,0.5,0.7'   # local, no SLURM
+#   sbatch [--array=0-N] [--nodelist=node1,node2,...] scripts/sweep.sh '<hydra overrides>'
+#   bash scripts/sweep.sh '<hydra overrides>'   # local, no SLURM
 #
 # Examples:
 #   sbatch scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'                  # 1 node
-#   sbatch --array=0-3 scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'      # 4 nodes,
-#       # each running the SAME grid but with a disjoint block of seeds (see NODE_INITIAL_SEED below)
+#   sbatch --array=0-3 scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'      # 4 nodes
+#   sbatch --array=0-1 --nodelist=pgi14-gpu7,pgi14-gpu8 scripts/sweep.sh 'circuit.extension=none'  # 2 named nodes
 #   RUNS_BATCH_SIZE=5 scripts/sweep.sh 'circuit.extension=none,metric_based circuit.extension_threshhold=0.3,0.5'
-#       # 2 x 2 combos x 5 seeds = 20 runs, all parallel on this node (auto thread budget)
 #   THREADS_PER_RUN=4 scripts/sweep.sh 'circuit.extension=none,metric_based'   # force 4 threads/run
 #
-# NOTE (SLURM): --output/--error directories must already exist before you `sbatch` this script --
-# SLURM creates the log FILE but not its parent directory, and the job fails immediately (with no
-# log at all) if the directory is missing. Run `mkdir -p outputs/slurm_logs` first, or edit the
-# paths below. Edit the partition (-p), --gres (if your cluster requires explicit GPU requests
-# even under --exclusive), --cpus-per-task and --time for your cluster.
+# NOTE: --output/--error directories must exist before `sbatch` (mkdir -p outputs/slurm_logs) --
+# SLURM creates the log file but not its parent directory. Edit the partition (-p), --gres,
+# --cpus-per-task and --time below for your cluster.
 # ==============================================================================
-#SBATCH -p <partition>                          # EDIT: your SLURM partition
+#SBATCH -p pgi14                                # EDIT: your SLURM partition
 #SBATCH --job-name=qcbm-sweep
 #SBATCH --error=outputs/slurm_logs/%A_%a.err    # %A = array job id, %a = array task id
 #SBATCH --output=outputs/slurm_logs/%A_%a.out
 #SBATCH --array=0                                # 0 = 1 node; 0-3 = 4 nodes (or pass --array on the CLI)
 #SBATCH --nodes=1                                # keep at 1 -- each array task gets 1 node
-#SBATCH --exclusive                               # whole node, all its GPUs
+#SBATCH --exclusive                               # whole node, all its CPUs (and GPUs, though unused here)
 #SBATCH --mem=0                                   # all available RAM on the node
 #SBATCH --cpus-per-task=4                         # EDIT: mostly cosmetic under --exclusive
-# #SBATCH --gres=gpu:4                            # EDIT/uncomment: some clusters require an explicit
-                                                   # GPU request even with --exclusive
+                                                   # GPU request even with --exclusive, even if unused
 #SBATCH --time=72:00:00
 
 set -euo pipefail
