@@ -126,10 +126,10 @@ def transpile_circuit(circuit: QuantumCircuit, transpiler: str = "service") -> Q
 def mps_cache_dir(cfg: DictConfig, X_train: np.ndarray) -> str:
     """Absolute cache directory for a trained MPS.
 
-    Keyed on the MPS-relevant hyperparameters plus a hash of the actual training data, so runs that
-    share an MPS (same dataset/qubits/params and same train split — the common case across a sweep's
-    seeds and extensions) reuse one cache entry, while genuinely different train sets (e.g. BAS
-    holdout with different seeds) get their own.
+    Keyed on the MPS-relevant hyperparameters plus a hash of the actual training data. Since the
+    train split is derived from initial_random_seed (see compute_split), all seeds in a sweep share
+    one train set and hence one cache entry; genuinely different train sets (different dataset /
+    qubits / MPS hyperparameters, or a different initial_random_seed) get their own.
     """
     data_hash = hashlib.md5(np.ascontiguousarray(X_train).tobytes()).hexdigest()[:10]
     key = (f"{cfg.data.dataset}_q{cfg.data.N_qubits}_cut{cfg.mps.cutoff}"
@@ -278,10 +278,14 @@ def setup_dataloader(cfg: DictConfig) -> DataLoader:
 
 
 def compute_split(cfg: DictConfig, dataloader: DataLoader) -> tuple:
-    """Compute the leakage-safe 3-way split once, using the per-run seed for BAS holdout."""
+    """Compute the leakage-safe 3-way split once.
+
+    The split is derived from the sweep's ``initial_random_seed``, NOT the per-run ``random_seed``,
+    so every run in a sweep sees an identical train/val/test split -- and therefore an identical
+    data-driven topology (metric_based/chow_liu) and MPS. """
     return dataloader.train_val_test_split(
         cfg.data.train_split, cfg.data.val_split,
-        seed=cfg.sweep.random_seed, bas_split_mode=cfg.data.bas_split_mode)
+        seed=cfg.sweep.initial_random_seed, bas_split_mode=cfg.data.bas_split_mode)
 
 
 def _coerce(value: str):

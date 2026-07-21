@@ -74,8 +74,9 @@ def _drain_pool() -> None:
 def pretrain_mps(cfg: DictConfig, seeds: list) -> None:
     """Train/cache the shared MPS(s) once, before the parallel fan-out, to avoid training races.
 
-    For JGB and BAS full_support the train set is seed-independent (one MPS); for BAS holdout each
-    seed has its own train set, so we dedup by cache key and pretrain each distinct one.
+    The train set is derived from initial_random_seed (see setup.compute_split), so it is identical
+    across all seeds in a sweep -- one MPS for the whole sweep. We still dedup by cache key (cheap
+    and future-proof if the split ever becomes seed-dependent again).
     """
     from src.setup import setup_dataloader, compute_split, get_or_train_mps, mps_cache_dir
 
@@ -96,17 +97,17 @@ def pretrain_mps(cfg: DictConfig, seeds: list) -> None:
 def main(cfg: DictConfig) -> None:
     global _NEXT_WORKER_INDEX
 
-    # Multi-node SLURM arrays (scripts/sweep.sh) run the IDENTICAL grid on every node; shift this
-    # node's seed block to stay disjoint from the others (node i uses seeds starting at
-    # initial_random_seed + i*runs_batch_size instead of every node repeating the same seeds).
-    # Read directly off cfg -- i.e. off config.yaml's values unless overridden on the CLI -- rather
-    # than the launcher shell hardcoding its own defaults, so config.yaml stays the single source of
+    # Multi-node SLURM arrays (scripts/sweep.sh) run the IDENTICAL grid on every node. Each node
+    # must use a disjoint block of per-run seeds (which drive weight init + sampling) so nodes don't
+    # duplicate work -- hence the per-node offset below. But initial_random_seed is left UNTOUCHED:
+    # it is the single, node-independent seed the data split (and thus the data-driven topology/MPS)
+    # is derived from (see setup.compute_split), so every run across the whole sweep shares one
+    # topology and the seeds only vary the training randomness. Read directly off cfg -- i.e. off
+    # config.yaml's values unless overridden on the CLI -- so config.yaml stays the single source of
     # truth for runs_batch_size/initial_random_seed regardless of how this is launched.
     node_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
-    if node_id:
-        cfg.sweep.initial_random_seed = cfg.sweep.initial_random_seed + node_id * cfg.sweep.runs_batch_size
-
-    seeds = [cfg.sweep.initial_random_seed + i for i in range(cfg.sweep.runs_batch_size)]
+    seed_offset = node_id * cfg.sweep.runs_batch_size
+    seeds = [cfg.sweep.initial_random_seed + seed_offset + i for i in range(cfg.sweep.runs_batch_size)]
     hydra_cfg = HydraConfig.get()
     # Local-only label for the .err log line and pool failure reporting (NOT a wandb group -- the
     # swept params are stored in each run's wandb config and are filtered on from there instead).

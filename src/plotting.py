@@ -50,30 +50,52 @@ _EXTENSION_LABELS = {
     "all_to_all": "all-to-all",
 }
 
+# Okabe & Ito (2008) colorblind-safe palette -- the de facto standard for categorical color in
+# scientific publishing (Wong, "Points of view: Color blindness", Nature Methods 8, 441, 2011).
+OKABE_ITO = {
+    "black": "#000000",
+    "orange": "#E69F00",
+    "sky_blue": "#56B4E9",
+    "bluish_green": "#009E73",
+    "yellow": "#F0E442",
+    "blue": "#0072B2",
+    "vermillion": "#D55E00",
+    "reddish_purple": "#CC79A7",
+}
+
+# fixed roles for the recurring extension categories, so their color stays constant across figures
+# regardless of which/how-many other keys are present
+_ROLE_COLORS = {
+    "metric-based": OKABE_ITO["orange"],
+    "chow-liu": OKABE_ITO["bluish_green"],
+    "nearest-neighbor": OKABE_ITO["sky_blue"],
+}
+# fixed draw order for any remaining (non-role) categorical keys
+_CB_CYCLE = [OKABE_ITO["blue"], OKABE_ITO["vermillion"], OKABE_ITO["reddish_purple"],
+            OKABE_ITO["yellow"], OKABE_ITO["orange"], OKABE_ITO["bluish_green"],
+            OKABE_ITO["sky_blue"]]
+
 
 def default_colors(legend_keys) -> dict:
-    """Color map preserving the v1 convention for extensions; sequential for numeric sweeps."""
+    """Color map preserving the v1 convention for extensions; Okabe-Ito colorblind-safe categorical
+    palette for named/extra keys, cividis (CVD-optimized sequential) for numeric sweeps."""
     keys = list(legend_keys)
     # numeric sweep dimension -> sequential colormap ordered by value
     try:
         numeric = sorted(keys, key=lambda k: float(k))
-        blues = plt.cm.viridis(np.linspace(0.15, 0.9, len(numeric)))
-        return {k: blues[i] for i, k in enumerate(numeric)}
+        shades = plt.cm.cividis(np.linspace(0.15, 0.9, len(numeric)))
+        return {k: shades[i] for i, k in enumerate(numeric)}
     except (TypeError, ValueError):
         pass
-    named = {"metric-based": "darkorange", "metric_based": "darkorange",
-             "chow-liu": "seagreen", "chow_liu": "seagreen",
-             "nearest-neighbor": "slategray", "nearest_neighbor": "slategray"}
-    blues = plt.cm.Blues(np.linspace(0.3, 1, max(len(keys), 2)))[::-1]
     colors = {}
-    bi = 0
+    ci = 0
     for k in keys:
         label = _EXTENSION_LABELS.get(k, k)
-        if label in named:
-            colors[k] = named[label]
+        if label in _ROLE_COLORS:
+            colors[k] = _ROLE_COLORS[label]
         else:
-            colors[k] = blues[bi % len(blues)]
-            bi += 1
+            colors[k] = _CB_CYCLE[ci % len(_CB_CYCLE)]
+            ci += 1
     return colors
 
 
@@ -305,9 +327,9 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
             dx, my = bm.qq_model_vs_data(mv, mp, data[:, i], n_q)
             nx_, ny = bm.qq_model_vs_normal(mv, mp, n_q)
             ndx, ndy = bm.qq_data_vs_normal(data[:, i], n_q)
-            ax.plot(dx, my, ".", ms=3, label="model vs data")
-            ax.plot(nx_, ny, ".", ms=3, label="model vs normal")
-            ax.plot(ndx, ndy, ".", ms=3, label="data vs normal")
+            ax.plot(dx, my, ".", ms=3, label="model vs data", color=OKABE_ITO["blue"])
+            ax.plot(nx_, ny, ".", ms=3, label="model vs normal", color=OKABE_ITO["vermillion"])
+            ax.plot(ndx, ndy, ".", ms=3, label="data vs normal", color=OKABE_ITO["bluish_green"])
             lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
             ax.plot(lims, lims, "k--", lw=0.6)
             ax.set_title(f"feature {i}")

@@ -355,9 +355,12 @@ def _test_split_for_config(cfg) -> tuple:
     else:
         dataset = JGB(cfg.data.N_qubits, cfg.data.N_features)
     dl = DataLoader(dataset)
+    # Reconstruct the SAME split training used: keyed on initial_random_seed (see
+    # setup.compute_split), not the per-run random_seed, so the held-out val/test targets match the
+    # run's training split (critical for BAS holdout, where the seed selects the partition).
     _, X_val, X_test, c_train, c_val, c_test = dl.train_val_test_split(
         cfg.data.train_split, cfg.data.val_split,
-        seed=cfg.sweep.random_seed, bas_split_mode=cfg.data.bas_split_mode)
+        seed=cfg.sweep.initial_random_seed, bas_split_mode=cfg.data.bas_split_mode)
     valid_patterns = dataset.binary if cfg.data.dataset == "BAS" else None
     return {"val": c_val, "test": c_test}, valid_patterns, c_train
 

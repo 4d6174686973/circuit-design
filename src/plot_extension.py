@@ -34,7 +34,7 @@ from src.extension import (linear_topology, nearest_neighbor_topology, all_to_al
 from src.utils import mutual_info_matrix, feature_distance_matrix, get_features_for_quasi_dist, array_to_str
 from src.data import BAS, JGB
 from src.setup import setup_dataloader, compute_split
-from src.plotting import _save, use_science_style
+from src.plotting import _save, use_science_style, OKABE_ITO
 
 _METRIC_LABELS = {"hamming": "Hamming distance", "varinfo": "Variation of Information"}
 
@@ -138,9 +138,9 @@ def plot_threshold_curve(thresholds: np.ndarray, counts: np.ndarray, threshold: 
     threshold_count = int(counts[threshold_idx])
     fig, ax = plt.subplots(figsize=(4, 2))
     ax.plot(thresholds, counts, color=plt.cm.Blues(0.8))
-    ax.axvline(threshold, color="darkorange", ls="--", lw=1)
+    ax.axvline(threshold, color=OKABE_ITO["vermillion"], ls="--", lw=1)
     ax.annotate(f"{rule} @ {threshold:.3f}\n({threshold_count} conn.)", xy=(threshold, threshold_count),
-               xytext=(8, 4), textcoords="offset points", fontsize=7, color="darkorange")
+               xytext=(8, 4), textcoords="offset points", fontsize=7, color=OKABE_ITO["vermillion"])
     ax.set_xlabel("Threshold"); ax.set_ylabel("Number of Connections")
     plt.tight_layout()
     if save:
@@ -175,7 +175,7 @@ def _draw_topology(ax, n_qubits, edges_base, edges_ext, title):
     pos = nx.circular_layout(G)
     nx.draw_networkx_nodes(G, pos, node_color="white", edgecolors="black", node_size=200, ax=ax)
     nx.draw_networkx_edges(G, pos, edgelist=edges_base, edge_color="black", ax=ax)
-    nx.draw_networkx_edges(G, pos, edgelist=edges_new, edge_color="cornflowerblue", ax=ax)
+    nx.draw_networkx_edges(G, pos, edgelist=edges_new, edge_color=OKABE_ITO["blue"], ax=ax)
     nx.draw_networkx_labels(G, pos, font_size=8, font_weight="bold", ax=ax)
     ax.set_title(title); ax.set_aspect("equal"); ax.set_frame_on(False)
     ax.set_xticks([]); ax.set_yticks([])
