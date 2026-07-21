@@ -616,7 +616,9 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
             cfg.qcbm.iterations, cfg.qcbm.N_shots, cfg.qcbm.mmd_batch_size,
             cfg.qcbm.loss_func, cfg.qcbm.sigmas,
             eval_every=cfg.qcbm.eval_every, model_selection_metric=cfg.qcbm.model_selection_metric,
-            wandb_run=run)
+            wandb_run=run,
+            dataset_kind=cfg.data.dataset,
+            valid_patterns=(dataloader.dataset.binary if cfg.data.dataset == "BAS" else None))
 
         # Save model + checkpoint
         qcbm.save(save_dir)

@@ -47,8 +47,11 @@ class QCBM:
         self.losses: dict[str, list] = {
             "mmd_train": [],
             "mmd_val": [],
-            "mmd_test": [],
-        }  # store all losses during training
+        }  # store all losses during training; held-out test tracking is test_bench_hist below
+        # full held-out test benchmark suite (mmd/kl/tv/fidelity + BAS coverage/spurious/gen*) per
+        # eval step; variable-key rows (gen/* only for BAS holdout) accumulated as dicts and dumped
+        # to test_metrics.parquet in save(). wandb receives the same dict inline each eval step.
+        self.test_bench_hist: list[dict] = []
 
         # best checkpoint (model selection); populated during training
         self.best_params: np.ndarray = self.parameters.copy()
@@ -128,17 +131,28 @@ class QCBM:
             self, X_train: np.ndarray, X_train_count: dict, X_val_count: dict, X_test_count: dict,
             iterations: int, N_shots: int, mmd_batch_size: int = 0,
             loss_func: str = 'MMD', sigmas: list = [1.0],
-            eval_every: int = 1, model_selection_metric: str = 'mmd_val', wandb_run=None):
+            eval_every: int = 1, model_selection_metric: str = 'mmd_val', wandb_run=None,
+            dataset_kind: str = None, valid_patterns: np.ndarray = None):
         """ Stochastic Gradient Descent with parameter-shift / finite-difference sampling.
 
         The train/validation/test splits are supplied by the caller (computed once upstream) so the
-        split is not recomputed here. Validation MMD drives model selection; the test MMD is logged
-        as a clean held-out metric only.
+        split is not recomputed here. Validation MMD drives model selection.
+
+        On every eval step the full benchmark suite (src.benchmark.evaluate: test/mmd, test/kl,
+        test/tv, test/fidelity, plus BAS coverage/spurious-mass and the Gili et al. gen/*
+        generalization metrics) is computed on the TEST split from the current-parameter samples and
+        logged to wandb, so the held-out test trajectory -- not just its final-checkpoint value -- is
+        tracked. This supersedes tracking a bare `mmd_test` loss: `test/mmd` uses the identical MMD
+        kernel/sigmas and is reported alongside the rest of the suite instead of as a separate metric.
+        valid_patterns scopes the BAS-only extras (coverage/spurious_mass/gen/*); it is ignored for
+        JGB. This logging is skipped (no test/* keys, no test_bench_hist rows) whenever the test
+        split is empty (e.g. val_size + train_size == 1).
         """
 
         logger = logging.getLogger('QCBM')
         self.model_selection_metric = model_selection_metric
         sigmas = np.array(sigmas)
+        from src.benchmark import evaluate  # local import avoids any import-time cycle with setup
 
         # Parameters
         if loss_func == 'KL':
@@ -152,10 +166,11 @@ class QCBM:
         self.weight_grad = np.zeros(self.circuit.num_parameters)  # current weight gradients
         [m, v] = [np.zeros(self.circuit.num_parameters) for _ in range(2)]  # adam variables
 
-        # pre-extract the held-out targets once (unchanged across iterations)
+        # pre-extract the held-out targets once (unchanged across iterations); the test split is
+        # evaluated via the benchmark.evaluate() suite below instead (test/mmd there uses the same
+        # kernel/sigmas), so it needs no separate sample_info extraction here.
         T_train, T_train_probs = sample_info(X_train_count)
         T_val, T_val_probs = sample_info(X_val_count) if len(X_val_count) else (None, None)
-        T_test, T_test_probs = sample_info(X_test_count) if len(X_test_count) else (None, None)
 
         measurements_per_step = (2 * self.circuit.num_parameters + 1) * N_shots
 
@@ -202,20 +217,29 @@ class QCBM:
 
             # Evaluate held-out losses (every eval_every iterations and on the final iteration)
             do_eval = (it % eval_every == 0) or (it == iterations - 1)
+            test_bench = {}
             if do_eval:
                 mmd_train = cost_mmd_pre(T_train, T_train_probs, S, S_probs, sigmas)
                 mmd_val = cost_mmd_pre(T_val, T_val_probs, S, S_probs, sigmas) if T_val is not None else np.nan
-                mmd_test = cost_mmd_pre(T_test, T_test_probs, S, S_probs, sigmas) if T_test is not None else np.nan
+                # full held-out test-set benchmark suite on the current-parameter samples S_counts;
+                # test/mmd (same kernel/sigmas) replaces the old standalone mmd_test loss.
+                if len(X_test_count):
+                    test_bench = evaluate(S_counts, {"test": X_test_count}, dataset_kind,
+                                          sigmas=sigmas, valid_patterns=valid_patterns,
+                                          train_patterns=X_train_count)
+                    self.test_bench_hist.append({"iteration": it, **test_bench})
             else:
-                mmd_train = mmd_val = mmd_test = np.nan
+                mmd_train = mmd_val = np.nan
             self.losses["mmd_train"].append(mmd_train)
             self.losses["mmd_val"].append(mmd_val)
-            self.losses["mmd_test"].append(mmd_test)
             loss_time = time.time()
 
-            # Model selection: keep the checkpoint (pre-update params) with the best metric
+            # Model selection: keep the checkpoint (pre-update params) with the best metric. Test-set
+            # metrics are deliberately NOT selectable here -- using the held-out test split to pick a
+            # checkpoint would leak it into model selection, defeating its purpose as a clean,
+            # touched-once evaluation set.
             if do_eval:
-                sel = {"mmd_train": mmd_train, "mmd_val": mmd_val, "mmd_test": mmd_test}[model_selection_metric]
+                sel = {"mmd_train": mmd_train, "mmd_val": mmd_val}[model_selection_metric]
                 if np.isfinite(sel) and sel < self.best_metric:
                     self.best_metric = float(sel)
                     self.best_iter = it
@@ -234,12 +258,16 @@ class QCBM:
                     "time/loss_s": loss_time - grad_time,
                 }
                 if do_eval:
-                    log.update({"mmd_train": mmd_train, "mmd_val": mmd_val, "mmd_test": mmd_test})
+                    log.update({"mmd_train": mmd_train, "mmd_val": mmd_val})
+                    # full test-set benchmark suite: test/mmd, test/kl, test/tv, test/fidelity, plus
+                    # BAS coverage/spurious_mass/gen/* when applicable
+                    log.update(test_bench)
                 wandb_run.log(log, step=it)
 
             # Final logging
             logger.info(f"| Total = {np.round(grad_time - start_time, 2)} s | Sampling = {np.round(sample_time - start_time, 2)} s | Gradient = {np.round(grad_time - sample_time, 2)} s | Loss = {np.round(loss_time - grad_time, 2)} s")
-            logger.info(f"| MMD loss | Train = {np.round(mmd_train, 6)} | Val = {np.round(mmd_val, 6)} | Test = {np.round(mmd_test, 6)}")
+            test_mmd_str = f"{test_bench['test/mmd']:.6f}" if "test/mmd" in test_bench else "n/a"
+            logger.info(f"| MMD loss | Train = {np.round(mmd_train, 6)} | Val = {np.round(mmd_val, 6)} | Test = {test_mmd_str}")
 
         logger.info(f"Training finished | best {model_selection_metric} = {np.round(self.best_metric, 6)} @ iter {self.best_iter}")
 
@@ -249,6 +277,10 @@ class QCBM:
         # save losses as file
         losses_df = pd.DataFrame(self.losses)
         losses_df.to_parquet(f"{save_dir}/losses.parquet")
+
+        # save the per-eval-step test benchmark suite (variable columns; gen/* only for BAS holdout)
+        if self.test_bench_hist:
+            pd.DataFrame(self.test_bench_hist).to_parquet(f"{save_dir}/test_metrics.parquet")
 
         # save full parameter history
         np.save(f"{save_dir}/params.npy", np.array(self.parameter_hist, dtype=object), allow_pickle=True)

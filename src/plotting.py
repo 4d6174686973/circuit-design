@@ -346,7 +346,7 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
 # orchestrator
 # --------------------------------------------------------------------------------------------------
 def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: dict,
-                         group_by: str = "circuit.extension", metrics=("mmd_train", "mmd_test"),
+                         group_by: str = "circuit.extension", metrics=("mmd_train", "test/mmd"),
                          plots_dir: str = "plots", science_style: bool = True):
     """Generate the training-dependent figure set for a sweep: MMD-vs-measurements + best-model
     benchmark (metric table, and QQ grids for JGB). Saves PDFs to plots_dir/<sweep_id>-<dataset>/,
@@ -409,7 +409,7 @@ def _parse_args(argv=None):
     parser.add_argument("--group-by", default="circuit.extension",
                         help="Dot-separated config key to use as the plot legend/grouping dimension "
                              "(default: circuit.extension; can be any swept key).")
-    parser.add_argument("--metrics", nargs="+", default=["mmd_train", "mmd_test"],
+    parser.add_argument("--metrics", nargs="+", default=["mmd_train", "test/mmd"],
                         help="Logged metrics to plot vs. cumulative measurements.")
     parser.add_argument("--plots-dir", default="plots", help="Output directory for the PDFs/PNGs.")
     parser.add_argument("--no-science-style", action="store_true",
