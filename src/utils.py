@@ -105,6 +105,7 @@ def get_features_for_quasi_dist(samples_dict, bits_per_feature, num_features):
 
 ### Variation of Information Metric ###
 import numpy as np,scipy.stats as ss
+from scipy.spatial import distance
 from sklearn.metrics import mutual_info_score
 
 def numBins(nObs,corr=None):
@@ -136,11 +137,43 @@ def varInfoMat(X, norm=False):
     metric = np.full([l,l], np.nan)
     for i in range(l):
         for j in range(l):
-            if not i == j: 
+            if not i == j:
                 metric[i,j] = varInfo(X.iloc[:,i].values, X.iloc[:,j].values, norm=norm)
             else:
                 metric[i,j] = 0
     return pd.DataFrame(metric, index=X.columns, columns=X.columns)
+
+def mutual_info_matrix(X: np.ndarray) -> np.ndarray:
+    '''Pairwise mutual information between the columns (features/qubits) of a binary matrix X.
+
+    Returns a symmetric (n_features x n_features) matrix whose (i, j) entry is I(X_i; X_j) in nats;
+    a higher value means the two feature-bits are more statistically dependent. This is the
+    edge-affinity consumed by extension.chow_liu_topology to build the Chow-Liu dependency tree.
+    The columns are already binary (one bit per qubit), so mutual_info_score is applied directly to
+    the label vectors -- no binning -- mirroring how the Hamming metric operates on the raw bits.'''
+    n = X.shape[1]
+    mim = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            mim[i, j] = mim[j, i] = mutual_info_score(X[:, i], X[:, j])
+    return mim
+
+def feature_distance_matrix(X: np.ndarray, metric: str) -> np.ndarray:
+    '''Pairwise feature-distance matrix consumed by the metric_based extension and its threshold
+    curve (extension.connection_threshold_curve / knee_threshold). Always returns an ndarray,
+    regardless of metric, so downstream code doesn't need to special-case a pandas DataFrame vs a
+    numpy array depending on which branch built it.
+
+    metric: "hamming" -> scipy Hamming distance over the raw bit-columns; "varinfo" -> normalized
+    variation of information (varInfoMat). Both are 0 for identical columns and increase with
+    dependence, i.e. LOWER distance means MORE dependent features.'''
+    if metric == "hamming":
+        X = np.asarray(X)
+        return distance.cdist(X.T, X.T, "hamming")
+    elif metric == "varinfo":
+        return varInfoMat(pd.DataFrame(X), norm=True).values
+    else:
+        raise ValueError(f"Invalid extension metric: {metric}")
 
 
 ### FOR PLOTTING RESULTS ###

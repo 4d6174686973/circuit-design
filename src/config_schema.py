@@ -56,10 +56,9 @@ class MpsConfig:
 
 @dataclass
 class CircuitConfig:
-    extension: str = "metric_based"        # none, all_to_all, nearest_neighbor, metric_based, random
-    N_random_extensions: int = 10          # number of random extensions to compare with metric_based: 10 for BAS, 13 for JGB
+    extension: str = "metric_based"        # none, all_to_all, nearest_neighbor, metric_based, chow_liu, random
     extension_metric: str = "hamming"      # hamming, varinfo
-    extension_threshhold: float = 0.5      # 0.5 for BAS + hamming, 0.95 for JGB + varinfo
+    threshold_rule: str = "knee"           # knee, percolation -- how metric_based auto-selects its threshold
 
 
 @dataclass

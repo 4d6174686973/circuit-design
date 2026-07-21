@@ -33,7 +33,8 @@ mps:
 
 ### Circuit setup ###
 circuit:
-  extension: metric_based         # none, all_to_all, nearest_neighbor, metric_based, random
+  extension: metric_based         # none, all_to_all, nearest_neighbor, metric_based, chow_liu, random
+  threshold_rule: percolation            # knee, percolation -- how metric_based auto-selects its threshold
 
 ### QCBM setup ###
 qcbm:

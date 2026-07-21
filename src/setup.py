@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import logging
-from scipy.spatial import distance
 import time
 import os
 import sys
@@ -24,8 +23,8 @@ from hydra.utils import to_absolute_path
 from src.qcbm import QCBM
 from src.mps import MPS
 from src.data import DataLoader, BAS, JGB
-from src.extension import compose_parameterized_circuit, linear_topology, all_to_all_topology, nearest_neighbor_topology, metric_based_topology, extend_circuit, random_topology
-from src.utils import varInfoMat
+from src.extension import compose_parameterized_circuit, linear_topology, all_to_all_topology, nearest_neighbor_topology, metric_based_topology, chow_liu_topology, extend_circuit, random_topology, select_threshold
+from src.utils import mutual_info_matrix, feature_distance_matrix
 from src.decompositon import mps2circuit
 
 
@@ -179,15 +178,24 @@ def get_or_train_mps(cfg: DictConfig, X_train: np.ndarray) -> QuantumCircuit:
             return qpy.load(file)[0]
     return train_mps(cfg, X_train, cache_dir)
 
+def _metric_based_connections(X_train: pd.DataFrame, extension_metric: str, threshold_rule: str) -> tuple:
+    """Distance matrix + auto-selected threshold (knee or percolation rule) + the resulting
+    metric_based edges. Shared by the metric_based and random branches of
+    setup_circuit_extensions -- random is sized to match this exactly, so it's a fair random
+    baseline for that comparison."""
+    dist = feature_distance_matrix(X_train, extension_metric)
+    threshhold = select_threshold(dist, threshold_rule)
+    return metric_based_topology(dist, threshhold), threshhold
+
+
 def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_train: pd.DataFrame) -> QuantumCircuit:
 
     # config parameters
     n_qubits = cfg.data.N_qubits
-    n_random_extensions = cfg.circuit.N_random_extensions
     dataset = cfg.data.dataset
     extension = cfg.circuit.extension
     extension_metric = cfg.circuit.extension_metric
-    extension_threshhold = cfg.circuit.extension_threshhold
+    threshold_rule = cfg.circuit.threshold_rule
     width = cfg.data.width
     height = cfg.data.height
     random_seed = cfg.sweep.random_seed
@@ -217,20 +225,31 @@ def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_tra
         extension_connections = nearest_neighbor_topology(width, height)
         extended_circuit = extend_circuit(mps_circuit, init_connections, extension_connections)
 
-    # metric based extension
+    # metric based extension: threshold is auto-selected via cfg.circuit.threshold_rule -- either the
+    # knee of the connections-vs-threshold curve (extension.knee_threshold) or the bond-percolation
+    # threshold (extension.percolation_threshold) -- rather than hand-tuned, so it adapts to the
+    # dataset/metric.
     elif extension == "metric_based":
-        if extension_metric == "hamming":
-            dist = distance.cdist(X_train.T, X_train.T, 'hamming')
-        elif extension_metric == "varinfo":
-            dist = varInfoMat(pd.DataFrame(X_train), norm=True)
-        else:
-            raise ValueError("Invalid extension metric.")
-        threshhold = extension_threshhold
-        extension_connections = metric_based_topology(dist, threshhold)
+        extension_connections, threshhold = _metric_based_connections(X_train, extension_metric, threshold_rule)
+        logger.info(f"metric_based ({extension_metric}) auto-threshold @ {threshold_rule} = {threshhold:.4f}")
         extended_circuit = extend_circuit(mps_circuit, init_connections, extension_connections)
 
-    # random extension
+    # chow-liu dependency-tree extension: the maximum-mutual-information spanning tree over the
+    # feature-bits. Same dependency signal as the metric-based method, but sparsified into the
+    # optimal n-1-edge tree instead of thresholded -- a parameter-free, connected backbone.
+    elif extension == "chow_liu":
+        affinity = mutual_info_matrix(np.asarray(X_train))
+        extension_connections = chow_liu_topology(affinity)
+        extended_circuit = extend_circuit(mps_circuit, init_connections, extension_connections)
+
+    # random extension: sized to exactly match the number of NEW connections metric_based would add
+    # (same dataset/metric), so it's a fair random baseline for that comparison rather than an
+    # arbitrarily chosen count.
     elif extension == "random":
+        metric_connections, _ = _metric_based_connections(X_train, extension_metric, threshold_rule)
+        n_random_extensions = len(set(metric_connections) - set(init_connections))
+        logger.info(f"random extension: matching metric_based ({extension_metric}) connection "
+                    f"count = {n_random_extensions}")
         extension_connections = random_topology(n_qubits, n_random_extensions, init_connections, random_seed)
         extended_circuit = extend_circuit(mps_circuit, init_connections, extension_connections)
 

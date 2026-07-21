@@ -2,13 +2,17 @@
 
 Replaces the hardcoded-path `results v1/plot_figures.ipynb`: figures that depend on training runs
 are built by pulling run histories from a wandb sweep (grouped by any config dimension), and MMD is
-plotted against cumulative circuit *measurements* rather than iteration index. Run-independent
-dataset/topology figures are ported from the notebook. All figures are saved as PDF (and PNG).
+plotted against cumulative circuit *measurements* rather than iteration index. All figures are
+saved as PDF (and PNG).
+
+Static, training-independent dataset/topology/threshold figures live in src.plot_extension instead
+-- they don't need a wandb sweep and only need regenerating when the data or extension settings
+change, not on every call here.
 
 Typical use:
     from src.plotting import generate_all_figures
     generate_all_figures(sweep_id="<sweep>", entity="<you>", project="qcbm-circuit-design",
-                         dataset_cfg={"dataset": "BAS", "width": 3, "height": 3, "N_qubits": 9})
+                         dataset_cfg={"dataset": "BAS"})
 """
 
 import os
@@ -17,13 +21,9 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import networkx as nx
 from omegaconf import OmegaConf
 
-from src.extension import (add_su4_gate, linear_topology, nearest_neighbor_topology,
-                           all_to_all_topology, metric_based_topology)
-from src.data import BAS, JGB, DataLoader, init_qubit_order_bas
-from src.utils import varInfoMat, get_features_for_quasi_dist, array_to_str
+from src.data import JGB, DataLoader
 from src.config_schema import from_run_config
 from src import benchmark as bm
 
@@ -46,6 +46,7 @@ _EXTENSION_LABELS = {
     "nearest_neighbor": "nearest-neighbor",
     "random": "random",
     "metric_based": "metric-based",
+    "chow_liu": "chow-liu",
     "all_to_all": "all-to-all",
 }
 
@@ -61,6 +62,7 @@ def default_colors(legend_keys) -> dict:
     except (TypeError, ValueError):
         pass
     named = {"metric-based": "darkorange", "metric_based": "darkorange",
+             "chow-liu": "seagreen", "chow_liu": "seagreen",
              "nearest-neighbor": "slategray", "nearest_neighbor": "slategray"}
     blues = plt.cm.Blues(np.linspace(0.3, 1, max(len(keys), 2)))[::-1]
     colors = {}
@@ -185,183 +187,6 @@ def plot_mmd_vs_measurements(runs_by_key: dict, metric: str = "mmd_train", mode:
 
 
 # --------------------------------------------------------------------------------------------------
-# run-independent dataset / topology figures (ported from plot_figures.ipynb)
-# --------------------------------------------------------------------------------------------------
-def plot_su4_gate(plots_dir: str = "plots", save: bool = True):
-    from qiskit import QuantumCircuit
-    from qiskit.circuit import ParameterVector
-    qc = QuantumCircuit(2)
-    params = ParameterVector("theta", 15)
-    add_su4_gate(qc, 0, 1, params)
-    fig = qc.draw(output="mpl")
-    if save:
-        _save(fig, plots_dir, "SU4_gate")
-    return fig
-
-
-def plot_bas_images(width=3, height=3, plots_dir: str = "plots", save: bool = True):
-    bas = BAS(width, height)
-    imgs = bas.binary
-    fig, axes = plt.subplots(1, len(imgs), figsize=(len(imgs), 2))
-    for i, ax in enumerate(np.atleast_1d(axes)):
-        ax.imshow(imgs[i].reshape(width, height), norm=plt.Normalize(0, 1), cmap="gray")
-        for _, spine in ax.spines.items():
-            spine.set_visible(True); spine.set_color("black"); spine.set_linewidth(1)
-        ax.set_xticks([]); ax.set_yticks([])
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "BAS_images")
-    return fig
-
-
-def plot_bas_extension(width=3, height=3, threshold=0.5, plots_dir: str = "plots", save: bool = True):
-    import seaborn as sns
-    from scipy.spatial import distance
-    X = BAS(width, height).binary
-    hamming = distance.cdist(X.T, X.T, "hamming")
-    dim = hamming.shape[0]
-    dist_filter = np.zeros_like(hamming)
-    dist_filter[hamming < threshold] = 1.0
-    dist_filter -= np.eye(dim)
-    fig, axs = plt.subplots(1, 2, figsize=(6, 2.6))
-    sns.heatmap(hamming, cmap="Blues", ax=axs[0], vmin=0.0, vmax=1.0)
-    axs[0].set_title("a) Hamming distance")
-    sns.heatmap(dist_filter, cmap="Blues", ax=axs[1])
-    axs[1].set_title("b) Circuit Extension")
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "BAS_extension")
-    return fig
-
-
-def _draw_topology(ax, n_qubits, edges_base, edges_ext, title):
-    edges_new = sorted(set(edges_ext) - set(edges_base))
-    G = nx.Graph(); G.add_nodes_from(range(n_qubits))
-    G.add_edges_from(edges_base); G.add_edges_from(edges_ext)
-    pos = nx.circular_layout(G)
-    nx.draw_networkx_nodes(G, pos, node_color="white", edgecolors="black", node_size=200, ax=ax)
-    nx.draw_networkx_edges(G, pos, edgelist=edges_base, edge_color="black", ax=ax)
-    nx.draw_networkx_edges(G, pos, edgelist=edges_new, edge_color="cornflowerblue", ax=ax)
-    nx.draw_networkx_labels(G, pos, font_size=8, font_weight="bold", ax=ax)
-    ax.set_title(title); ax.set_aspect("equal"); ax.set_frame_on(False)
-    ax.set_xticks([]); ax.set_yticks([])
-
-
-def plot_bas_topology(width=3, height=3, threshold=0.5, plots_dir: str = "plots", save: bool = True):
-    from scipy.spatial import distance
-    n_qubits = width * height
-    X = BAS(width, height).binary
-    hamming = distance.cdist(X.T, X.T, "hamming")
-    edges_lin = linear_topology(init_qubit_order_bas["3x3"]) if (width, height) == (3, 3) \
-        else linear_topology(list(range(n_qubits)))
-    extensions = {
-        "a) Linear": edges_lin,
-        "b) Nearest-Neighbor": nearest_neighbor_topology(width, height),
-        "c) Metric-Based": metric_based_topology(hamming, threshold),
-        "d) All-to-All": all_to_all_topology(n_qubits),
-    }
-    fig, axs = plt.subplots(2, 2, figsize=(6, 6))
-    for ax, (name, edges) in zip(axs.flatten(), extensions.items()):
-        _draw_topology(ax, n_qubits, edges_lin, edges, name)
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "BAS_topology")
-    return fig
-
-
-def plot_jgb_raw_data(N_qubits=12, N_features=3, plots_dir: str = "plots", save: bool = True):
-    jgb = JGB(N_qubits, N_features)
-    df0 = jgb.raw
-    colors = plt.cm.Blues(np.linspace(0.4, 1, len(df0.columns)))[::-1]
-    fig, ax = plt.subplots(1, 1, figsize=(5, 3))
-    for i, c in enumerate(df0.columns):
-        ax.plot(df0[c], label=f"{c[:-1]}-year Rate", color=colors[i])
-    ax.set_xlabel("Date"); ax.set_ylabel("Interest Rate [%]"); ax.legend()
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "JGB_raw_data")
-    return fig
-
-
-def plot_jgb_binary_histograms(N_qubits=12, N_features=3, plots_dir: str = "plots", save: bool = True):
-    from collections import Counter
-    from qiskit.visualization import plot_histogram
-    from matplotlib.colors import to_hex
-    jgb = JGB(N_qubits, N_features)
-    bits_per_feature = N_qubits // N_features
-    target_dict = Counter(array_to_str(jgb.binary))
-    feat_dicts = get_features_for_quasi_dist(target_dict, bits_per_feature, N_features)
-    labels = ([f"{t}" for t in ["5-year", "10-year", "20-year"]] if N_features == 3
-              else ["2-year", "5-year", "10-year", "20-year"])
-    colors = [to_hex(c) for c in plt.cm.Blues(np.linspace(0.4, 1, N_features))[::-1]]
-    fig, axs = plt.subplots(N_features, 1, figsize=(5, 5))
-    for i, ax in enumerate(np.atleast_1d(axs)):
-        plot_histogram(feat_dicts[i], ax=ax, bar_labels=False, color=colors[i])
-        ax.set_title(labels[i])
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "JGB_binary_histograms")
-    return fig
-
-
-def plot_jgb_threshold(N_qubits=12, N_features=3, plots_dir: str = "plots", save: bool = True):
-    jgb = JGB(N_qubits, N_features); dl = DataLoader(jgb)
-    X, *_ = dl.train_val_test_split(0.7, 0.15)
-    num_steps = 100
-    steps = np.linspace(1 / num_steps, 1, num_steps)
-    num_connections = np.zeros_like(steps)
-    varinfo = varInfoMat(pd.DataFrame(X), norm=True).values
-    dim = varinfo.shape[0]
-    for i, threshold in enumerate(steps):
-        dist_filter = np.zeros_like(varinfo)
-        dist_filter[varinfo < threshold] = 1.0
-        dist_filter -= np.eye(dim)
-        num_connections[i] = np.sum(dist_filter) / 2
-    fig, ax = plt.subplots(figsize=(4, 2))
-    ax.plot(steps, num_connections, color=plt.cm.Blues(0.8))
-    ax.set_xlabel("Threshold"); ax.set_ylabel("Number of Connections")
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "JGB_threshold")
-    return fig
-
-
-def plot_jgb_extension(N_qubits=12, N_features=3, threshold=0.95, plots_dir: str = "plots", save: bool = True):
-    import seaborn as sns
-    jgb = JGB(N_qubits, N_features); dl = DataLoader(jgb)
-    X, *_ = dl.train_val_test_split(0.7, 0.15)
-    varinfo = varInfoMat(pd.DataFrame(X), norm=True).values
-    dim = varinfo.shape[0]
-    dist_filter = np.zeros_like(varinfo)
-    dist_filter[varinfo < threshold] = 1.0
-    dist_filter -= np.eye(dim)
-    fig, axs = plt.subplots(1, 2, figsize=(6, 2.6))
-    sns.heatmap(varinfo, ax=axs[0], cmap="Blues", vmin=0, vmax=1)
-    axs[0].set_title("a) Variation of Information")
-    sns.heatmap(dist_filter, ax=axs[1], cmap="Blues", vmin=0, vmax=1)
-    axs[1].set_title("b) Circuit Extension")
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "JGB_extension")
-    return fig
-
-
-def plot_jgb_topology(N_qubits=12, N_features=3, threshold=0.95, plots_dir: str = "plots", save: bool = True):
-    jgb = JGB(N_qubits, N_features); dl = DataLoader(jgb)
-    X, *_ = dl.train_val_test_split(0.7, 0.15)
-    varinfo = varInfoMat(pd.DataFrame(X), norm=True)
-    edges_lin = [(i, i + 1) for i in range(N_qubits - 1)]
-    edges_ext = metric_based_topology(varinfo.values, threshold)
-    fig, axs = plt.subplots(1, 2, figsize=(6, 2.9))
-    _draw_topology(axs[0], N_qubits, edges_lin, edges_lin, "a) Linear")
-    _draw_topology(axs[1], N_qubits, edges_lin, edges_ext, "b) Extended")
-    plt.tight_layout()
-    if save:
-        _save(fig, plots_dir, "JGB_topology")
-    return fig
-
-
-# --------------------------------------------------------------------------------------------------
 # benchmark figures (best model per group)
 # --------------------------------------------------------------------------------------------------
 def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by: str = "circuit.extension",
@@ -451,10 +276,15 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
 def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: dict,
                          group_by: str = "circuit.extension", metrics=("mmd_train", "mmd_test"),
                          plots_dir: str = "plots", science_style: bool = True):
-    """Generate the full figure set for a sweep: static dataset/topology + MMD-vs-measurements +
-    best-model benchmark (metric table, and QQ grids for JGB). Saves PDFs to
-    plots_dir/<sweep_id>-<dataset>/, so figures from different sweeps/datasets never collide or
-    get mixed together in one flat folder."""
+    """Generate the training-dependent figure set for a sweep: MMD-vs-measurements + best-model
+    benchmark (metric table, and QQ grids for JGB). Saves PDFs to plots_dir/<sweep_id>-<dataset>/,
+    so figures from different sweeps/datasets never collide or get mixed together in one flat
+    folder.
+
+    Static dataset/topology/threshold figures (SU(4) gate, preprocessing, threshold curve,
+    extension heatmaps, topology networks) don't depend on training and are NOT generated here --
+    see src.plot_extension, which is config-driven and only needs to be (re)run when the data or
+    extension settings change, not on every sweep."""
     if science_style:
         use_science_style()
     dataset = dataset_cfg.get("dataset", "BAS")
@@ -462,25 +292,8 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
 
     print(f"[plotting] sweep={sweep_id} dataset={dataset} group_by={group_by} -> {plots_dir}/")
 
-    # 1) run-independent figures
-    print("[plotting] (1/3) static dataset/topology figures...")
-    plot_su4_gate(plots_dir)
-    if dataset == "BAS":
-        w, h = dataset_cfg.get("width", 3), dataset_cfg.get("height", 3)
-        plot_bas_images(w, h, plots_dir=plots_dir)
-        plot_bas_extension(w, h, dataset_cfg.get("extension_threshhold", 0.5), plots_dir=plots_dir)
-        plot_bas_topology(w, h, dataset_cfg.get("extension_threshhold", 0.5), plots_dir=plots_dir)
-    else:
-        nq, nf = dataset_cfg.get("N_qubits", 12), dataset_cfg.get("N_features", 3)
-        plot_jgb_raw_data(nq, nf, plots_dir=plots_dir)
-        plot_jgb_binary_histograms(nq, nf, plots_dir=plots_dir)
-        plot_jgb_threshold(nq, nf, plots_dir=plots_dir)
-        plot_jgb_extension(nq, nf, dataset_cfg.get("extension_threshhold", 0.95), plots_dir=plots_dir)
-        plot_jgb_topology(nq, nf, dataset_cfg.get("extension_threshhold", 0.95), plots_dir=plots_dir)
-    print("[plotting]     done.")
-
-    # 2) MMD-vs-measurements over all seeds
-    print("[plotting] (2/3) fetching runs from wandb...")
+    # 1) MMD-vs-measurements over all seeds
+    print("[plotting] (1/2) fetching runs from wandb...")
     grouped = fetch_runs(sweep_id, entity, project, group_by)
     n_runs = sum(len(v) for v in grouped.values())
     print(f"[plotting]     found {n_runs} runs across {len(grouped)} group(s): "
@@ -491,8 +304,8 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
                                  plots_dir=plots_dir)
     print("[plotting]     done.")
 
-    # 3) best-model benchmark figures
-    print("[plotting] (3/3) benchmarking best model per group...")
+    # 2) best-model benchmark figures
+    print("[plotting] (2/2) benchmarking best model per group...")
     bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by)
     plot_metric_table(bench_df, group_by=group_by, plots_dir=plots_dir)
     if dataset == "JGB":
@@ -509,24 +322,18 @@ def _parse_args(argv=None):
     import argparse
     parser = argparse.ArgumentParser(
         prog="python -m src.plotting",
-        description="Regenerate all figures (dataset/topology, MMD-vs-measurements, best-model "
-                    "benchmark) for a wandb sweep and save them as PDF.")
+        description="Regenerate the training-dependent figures (MMD-vs-measurements, best-model "
+                    "benchmark) for a wandb sweep and save them as PDF. For the static dataset/"
+                    "topology/threshold figures, use `python -m src.plot_extension` instead.")
     parser.add_argument("--sweep-id", required=True,
                         help="wandb sweep id, e.g. printed in a run's log line "
                              "'Program started (..., sweep_id=...)', or from the Sweeps tab.")
     parser.add_argument("--project", required=True, help="wandb project name.")
     parser.add_argument("--entity", default=None, help="wandb entity (default: your default entity).")
     parser.add_argument("--dataset", choices=["BAS", "JGB"], default="BAS")
-    parser.add_argument("--width", type=int, default=3, help="BAS grid width.")
-    parser.add_argument("--height", type=int, default=3, help="BAS grid height.")
-    parser.add_argument("--n-qubits", type=int, default=12, help="JGB qubit count.")
-    parser.add_argument("--n-features", type=int, default=3, help="JGB feature count (3 or 4).")
-    parser.add_argument("--extension-threshold", type=float, default=None,
-                        help="Threshold for the extension/topology figures "
-                             "(default: 0.5 for BAS, 0.95 for JGB).")
     parser.add_argument("--group-by", default="circuit.extension",
                         help="Dot-separated config key to use as the plot legend/grouping dimension "
-                             "(default: circuit.extension; can be any swept key, e.g. circuit.extension_threshhold).")
+                             "(default: circuit.extension; can be any swept key).")
     parser.add_argument("--metrics", nargs="+", default=["mmd_train", "mmd_test"],
                         help="Logged metrics to plot vs. cumulative measurements.")
     parser.add_argument("--plots-dir", default="plots", help="Output directory for the PDFs/PNGs.")
@@ -537,15 +344,7 @@ def _parse_args(argv=None):
 
 def main(argv=None):
     args = _parse_args(argv)
-    dataset_cfg = {
-        "dataset": args.dataset,
-        "width": args.width,
-        "height": args.height,
-        "N_qubits": args.n_qubits,
-        "N_features": args.n_features,
-    }
-    if args.extension_threshold is not None:
-        dataset_cfg["extension_threshhold"] = args.extension_threshold
+    dataset_cfg = {"dataset": args.dataset}
 
     bench_df = generate_all_figures(
         sweep_id=args.sweep_id,

@@ -7,6 +7,4 @@ data:
   N_qubits: 9                     # width * height
   bas_split_mode: full_support    # full_support (all patterns in every split) or holdout (seeded disjoint partition)
 circuit:
-  N_random_extensions: 10         # number of random extensions to compare with metric_based
   extension_metric: hamming       # hamming, varinfo
-  extension_threshhold: 0.5       # threshold tuned for BAS + hamming
