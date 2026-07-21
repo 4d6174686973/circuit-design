@@ -5,6 +5,8 @@ step. Metrics consume the {bitstring: count} dictionary format used throughout t
 reuse helpers from src.utils / src.cost so the held-out MMD matches the training kernel exactly.
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 import scipy.stats as ss
@@ -207,19 +209,33 @@ def select_best_run(runs: list, metric: str = "best_mmd_val"):
 
 
 def load_checkpoint(run, root: str = "./artifacts"):
-    """Download a run's model artifact and load (circuit, best_params)."""
+    """Download a run's model artifact and load (circuit, best_params).
+
+    Skips the download entirely -- including the network round-trip to fetch/verify the artifact
+    manifest -- if both expected files are already present locally under root/run.id. Safe here
+    because each run logs exactly one model artifact, written once at the end of training (see
+    src/setup.py::setup_and_train_qcbm), so there is no newer version a stale local copy could miss.
+    """
     from qiskit import qpy
-    art = None
-    for a in run.logged_artifacts():
-        if a.type == "model":
-            art = a
-            break
-    if art is None:
-        raise FileNotFoundError(f"No model artifact for run {run.id}")
-    path = art.download(root=f"{root}/{run.id}")
-    with open(f"{path}/circuit.qpy", "rb") as f:
+    local_dir = f"{root}/{run.id}"
+    circuit_path = f"{local_dir}/circuit.qpy"
+    params_path = f"{local_dir}/best_params.npy"
+
+    if os.path.exists(circuit_path) and os.path.exists(params_path):
+        print(f"[benchmark]     [{run.id}] checkpoint already downloaded, reusing {local_dir}")
+    else:
+        art = None
+        for a in run.logged_artifacts():
+            if a.type == "model":
+                art = a
+                break
+        if art is None:
+            raise FileNotFoundError(f"No model artifact for run {run.id}")
+        art.download(root=local_dir)
+
+    with open(circuit_path, "rb") as f:
         circuit = qpy.load(f)[0]
-    best_params = np.load(f"{path}/best_params.npy")
+    best_params = np.load(params_path)
     return circuit, best_params
 
 
@@ -258,6 +274,7 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "e
     """
     import wandb
     api = wandb.Api()
+    entity = entity or api.default_entity  # unresolved None would literally build ".../None/..."
     runs = api.sweep(f"{entity}/{project}/{sweep_id}").runs
 
     groups = {}
@@ -267,11 +284,16 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "e
 
     rows = []
     for key, group_runs in groups.items():
+        print(f"[benchmark]     [{key}] {len(group_runs)} run(s) -> selecting best by {metric}...")
         best = select_best_run(group_runs, metric)
         if best is None:
+            print(f"[benchmark]     [{key}] no run with a finite {metric}, skipping.")
             continue
+        print(f"[benchmark]     [{key}] best run {best.id} ({metric}={best.summary.get(metric)}); "
+              f"downloading checkpoint...")
         circuit, params = load_checkpoint(best)
         splits, valid_patterns = _test_split_for_config(best.config)
+        print(f"[benchmark]     [{key}] sampling {n_shots} shots and evaluating metrics...")
         samples = sample_model(circuit, params, n_shots, seed=best.config.get("random_seed", 0))
         row = {group_by: key, "run_id": best.id, "run_name": best.name,
                "best_mmd_val": best.summary.get(metric)}

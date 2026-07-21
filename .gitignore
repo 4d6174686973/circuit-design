@@ -161,9 +161,9 @@ cython_debug/
 
 
 # own stuff
-ibm_token.txt
 outputs/
 plots/
 multirun/
 data/
 wandb/
+artifacts/

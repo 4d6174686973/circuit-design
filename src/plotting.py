@@ -91,6 +91,7 @@ def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "extens
     """
     import wandb
     api = wandb.Api()
+    entity = entity or api.default_entity  # unresolved None would literally build ".../None/..."
     runs = list(api.sweep(f"{entity}/{project}/{sweep_id}").runs)
     if filters:
         runs = [r for r in runs if all(r.config.get(k) == v for k, v in filters.items())]
@@ -350,18 +351,38 @@ def plot_jgb_topology(N_qubits=12, N_features=3, threshold=0.95, plots_dir: str 
 # --------------------------------------------------------------------------------------------------
 # benchmark figures (best model per group)
 # --------------------------------------------------------------------------------------------------
-def plot_metric_bars(bench_df: pd.DataFrame, metric_col: str = "test/mmd", group_by: str = "extension",
-                     plots_dir: str = "plots", filename: str = None, save: bool = True):
-    """Bar chart of a benchmark metric across groups (best model per group)."""
-    if bench_df is None or bench_df.empty or metric_col not in bench_df:
+def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by: str = "extension",
+                      plots_dir: str = "plots", filename: str = "benchmark_table", save: bool = True,
+                      precision: int = 4):
+    """Table of benchmark metrics across groups (one row per group's best model).
+
+    Renders as a matplotlib table (saved as PDF/PNG, consistent with the other figures) and also
+    writes a plain CSV alongside with full float precision, since a rendered table is for reading,
+    not for downstream analysis.
+    """
+    if bench_df is None or bench_df.empty:
         return None
-    filename = filename or f"benchmark_{metric_col.replace('/', '_')}"
-    fig, ax = plt.subplots(figsize=(5, 3))
+    if metric_cols is None:
+        metric_cols = [c for c in ["test/mmd", "test/tv", "test/fidelity"] if c in bench_df]
+    metric_cols = [c for c in metric_cols if c in bench_df]
+    if not metric_cols:
+        return None
+
     labels = [_EXTENSION_LABELS.get(k, str(k)) for k in bench_df[group_by]]
-    colors = default_colors(bench_df[group_by])
-    ax.bar(labels, bench_df[metric_col], color=[colors.get(k) for k in bench_df[group_by]])
-    ax.set_ylabel(metric_col); ax.set_xlabel(group_by)
-    plt.xticks(rotation=30, ha="right")
+    display_df = bench_df[metric_cols].round(precision)
+
+    if save:
+        os.makedirs(plots_dir, exist_ok=True)
+        bench_df[[group_by, *metric_cols]].to_csv(f"{plots_dir}/{filename}.csv", index=False)
+
+    n_rows, n_cols = len(display_df), len(metric_cols)
+    fig, ax = plt.subplots(figsize=(1.4 * (n_cols + 1) + 1, 0.4 * (n_rows + 1) + 0.5))
+    ax.axis("off")
+    table = ax.table(cellText=display_df.values, rowLabels=labels, colLabels=metric_cols,
+                     loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.5)
     plt.tight_layout()
     if save:
         _save(fig, plots_dir, filename)
@@ -371,14 +392,13 @@ def plot_metric_bars(bench_df: pd.DataFrame, metric_col: str = "test/mmd", group
 def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "extension",
                  n_shots: int = 10000, n_q: int = 100, plots_dir: str = "plots", save: bool = True):
     """Per-group QQ plots (model vs data, model vs normal, data vs normal) for JGB best models."""
-    import wandb
-    api = wandb.Api()
     grouped = fetch_runs(sweep_id, entity, project, group_by)
     figs = {}
     for key, runs in grouped.items():
         best = bm.select_best_run(runs)
         if best is None or best.config.get("dataset") != "JGB":
             continue
+        print(f"[plotting]     [{key}] QQ plots from best run {best.id}...")
         circuit, params = bm.load_checkpoint(best)
         samples = bm.sample_model(circuit, params, n_shots, seed=best.config.get("random_seed", 0))
         splits, _ = bm._test_split_for_config(best.config)
@@ -417,12 +437,18 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
                          group_by: str = "extension", metrics=("mmd_train", "mmd_test"),
                          plots_dir: str = "plots", science_style: bool = True):
     """Generate the full figure set for a sweep: static dataset/topology + MMD-vs-measurements +
-    best-model benchmark (metric bars, and QQ grids for JGB). Saves PDFs to plots_dir."""
+    best-model benchmark (metric table, and QQ grids for JGB). Saves PDFs to
+    plots_dir/<sweep_id>-<dataset>/, so figures from different sweeps/datasets never collide or
+    get mixed together in one flat folder."""
     if science_style:
         use_science_style()
     dataset = dataset_cfg.get("dataset", "BAS")
+    plots_dir = os.path.join(plots_dir, f"{sweep_id}-{dataset}")
+
+    print(f"[plotting] sweep={sweep_id} dataset={dataset} group_by={group_by} -> {plots_dir}/")
 
     # 1) run-independent figures
+    print("[plotting] (1/3) static dataset/topology figures...")
     plot_su4_gate(plots_dir)
     if dataset == "BAS":
         w, h = dataset_cfg.get("width", 3), dataset_cfg.get("height", 3)
@@ -436,17 +462,90 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
         plot_jgb_threshold(nq, nf, plots_dir=plots_dir)
         plot_jgb_extension(nq, nf, dataset_cfg.get("extension_threshhold", 0.95), plots_dir=plots_dir)
         plot_jgb_topology(nq, nf, dataset_cfg.get("extension_threshhold", 0.95), plots_dir=plots_dir)
+    print("[plotting]     done.")
 
     # 2) MMD-vs-measurements over all seeds
+    print("[plotting] (2/3) fetching runs from wandb...")
     grouped = fetch_runs(sweep_id, entity, project, group_by)
+    n_runs = sum(len(v) for v in grouped.values())
+    print(f"[plotting]     found {n_runs} runs across {len(grouped)} group(s): "
+          f"{', '.join(str(k) for k in grouped)}")
     for metric in metrics:
+        print(f"[plotting]     plotting {metric} vs. measurements...")
         plot_mmd_vs_measurements(grouped, metric=metric, filename=f"{metric}_measurements",
                                  plots_dir=plots_dir)
+    print("[plotting]     done.")
 
     # 3) best-model benchmark figures
+    print("[plotting] (3/3) benchmarking best model per group...")
     bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by)
-    for col in ["test/mmd", "test/tv", "test/fidelity"]:
-        plot_metric_bars(bench_df, col, group_by, plots_dir=plots_dir)
+    plot_metric_table(bench_df, group_by=group_by, plots_dir=plots_dir)
     if dataset == "JGB":
         plot_qq_grid(sweep_id, entity, project, group_by, plots_dir=plots_dir)
+    print("[plotting]     done.")
+    print(f"[plotting] finished -- figures in {plots_dir}/")
     return bench_df
+
+
+# --------------------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------------------
+def _parse_args(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="python -m src.plotting",
+        description="Regenerate all figures (dataset/topology, MMD-vs-measurements, best-model "
+                    "benchmark) for a wandb sweep and save them as PDF.")
+    parser.add_argument("--sweep-id", required=True,
+                        help="wandb sweep id, e.g. printed in a run's log line "
+                             "'Program started (..., sweep_id=...)', or from the Sweeps tab.")
+    parser.add_argument("--project", required=True, help="wandb project name.")
+    parser.add_argument("--entity", default=None, help="wandb entity (default: your default entity).")
+    parser.add_argument("--dataset", choices=["BAS", "JGB"], default="BAS")
+    parser.add_argument("--width", type=int, default=3, help="BAS grid width.")
+    parser.add_argument("--height", type=int, default=3, help="BAS grid height.")
+    parser.add_argument("--n-qubits", type=int, default=12, help="JGB qubit count.")
+    parser.add_argument("--n-features", type=int, default=3, help="JGB feature count (3 or 4).")
+    parser.add_argument("--extension-threshold", type=float, default=None,
+                        help="Threshold for the extension/topology figures "
+                             "(default: 0.5 for BAS, 0.95 for JGB).")
+    parser.add_argument("--group-by", default="extension",
+                        help="Config key to use as the plot legend/grouping dimension "
+                             "(default: extension; can be any swept key, e.g. extension_threshhold).")
+    parser.add_argument("--metrics", nargs="+", default=["mmd_train", "mmd_test"],
+                        help="Logged metrics to plot vs. cumulative measurements.")
+    parser.add_argument("--plots-dir", default="plots", help="Output directory for the PDFs/PNGs.")
+    parser.add_argument("--no-science-style", action="store_true",
+                        help="Skip the scienceplots styling (use matplotlib defaults).")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    dataset_cfg = {
+        "dataset": args.dataset,
+        "width": args.width,
+        "height": args.height,
+        "N_qubits": args.n_qubits,
+        "N_features": args.n_features,
+    }
+    if args.extension_threshold is not None:
+        dataset_cfg["extension_threshhold"] = args.extension_threshold
+
+    bench_df = generate_all_figures(
+        sweep_id=args.sweep_id,
+        entity=args.entity,
+        project=args.project,
+        dataset_cfg=dataset_cfg,
+        group_by=args.group_by,
+        metrics=tuple(args.metrics),
+        plots_dir=args.plots_dir,
+        science_style=not args.no_science_style,
+    )
+    print(f"Figures written to {args.plots_dir}/{args.sweep_id}-{args.dataset}/")
+    if bench_df is not None and not bench_df.empty:
+        print(bench_df.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

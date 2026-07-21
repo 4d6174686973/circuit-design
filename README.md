@@ -83,13 +83,20 @@ that file for `sbatch`/multi-node usage.
 
 Once a sweep has runs, regenerate all figures (including the paper's dataset/topology plots, MMD
 over cumulative measurements, and best-model QQ/benchmark plots) as PDF:
-```python
-from src.plotting import generate_all_figures
-generate_all_figures(sweep_id="<sweep_id>", entity="<entity>", project="qcbm-circuit-design",
-                     dataset_cfg={"dataset": "BAS", "width": 3, "height": 3, "N_qubits": 9})
+```sh
+# BAS
+uv run python -m src.plotting --sweep-id "<sweep_id>" --project qcbm-circuit-design \
+    --dataset BAS --width 3 --height 3
+
+# JGB
+uv run python -m src.plotting --sweep-id "<sweep_id>" --project qcbm-circuit-design \
+    --dataset JGB --n-qubits 12 --n-features 3
 ```
 The `sweep_id` is printed in every run's log line (`Program started (..., sweep_id=...)`), or find it
-under the wandb project's Sweeps tab.
+under the wandb project's Sweeps tab. Run `uv run python -m src.plotting --help` for all options
+(`--entity`, `--group-by` to legend by a different swept parameter, `--metrics`, `--plots-dir`, ...).
+Figures are saved under `<plots-dir>/<sweep_id>-<dataset>/` (default `plots/<sweep_id>-<dataset>/`),
+so different sweeps/datasets never collide or mix in one flat folder.
 
 ## Testing and code coverage
 ```sh
