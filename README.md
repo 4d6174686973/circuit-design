@@ -42,8 +42,9 @@ Results will be saved in `outputs/`
 
 Dataset-specific settings (`N_qubits`, `width`/`height`, `N_features`, `extension_metric`, ...) live in
 `src/conf/dataset/BAS.yaml` and `src/conf/dataset/JGB.yaml`, both merged into the same base
-`src/conf/config.yaml` layout. Switch between them with the single `dataset` override, on the CLI or
-via `scripts/sweep.sh`'s `DATASET` env var:
+`src/conf/config.yaml` layout. Switch between them with the single `dataset` override, the same way
+whether you're calling `python -m src` directly or via `scripts/sweep.sh` (it just forwards the
+override string you give it):
 ```sh
 uv run python -m src dataset=BAS
 uv run python -m src dataset=JGB
@@ -125,7 +126,7 @@ that file for `sbatch`/multi-node usage. `--array`/`--nodelist` are plain `sbatc
 specific nodes needs no script changes, e.g. two named nodes (used here for their CPUs only — this
 launcher is CPU-only, see below — even if the nodes happen to also have GPUs):
 ```sh
-sbatch --array=0-1 --nodelist=pgi14-gpu7,pgi14-gpu8 scripts/sweep.sh 'circuit.extension=none,metric_based,all_to_all'
+sbatch --array=0-1 --nodelist=pgi14-gpu7,pgi14-gpu8 scripts/sweep.sh circuit.extension=none,metric_based,all_to_all
 ```
 
 ## GPU (future work)
@@ -142,7 +143,8 @@ future work. The swap points are marked with `GPU NOTE` comments in the code:
   `blocking`) already exists; verify VRAM/blocking sizing for the target GPUs.
 - `src/cost.py`, `src/qcbm.py` — move the per-iteration kernel/gradient math onto the GPU (e.g.
   `cupy`) so a run stays device-resident across the whole iteration, not just during sampling.
-- `scripts/sweep.sh` — add `#SBATCH --gres=gpu:N`, set `GPUS_PER_NODE=N`, `SIMULATOR=aer_statevec_gpu`.
+- `scripts/sweep.sh` — add `#SBATCH --gres=gpu:N`; pass `sweep.gpus_per_node=N ibm.simulator=aer_statevec_gpu`
+  in the override string.
 
 Once a sweep has runs, regenerate all figures (including the paper's dataset/topology plots, MMD
 over cumulative measurements, and best-model QQ/benchmark plots) as PDF:

@@ -96,6 +96,16 @@ def pretrain_mps(cfg: DictConfig, seeds: list) -> None:
 def main(cfg: DictConfig) -> None:
     global _NEXT_WORKER_INDEX
 
+    # Multi-node SLURM arrays (scripts/sweep.sh) run the IDENTICAL grid on every node; shift this
+    # node's seed block to stay disjoint from the others (node i uses seeds starting at
+    # initial_random_seed + i*runs_batch_size instead of every node repeating the same seeds).
+    # Read directly off cfg -- i.e. off config.yaml's values unless overridden on the CLI -- rather
+    # than the launcher shell hardcoding its own defaults, so config.yaml stays the single source of
+    # truth for runs_batch_size/initial_random_seed regardless of how this is launched.
+    node_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+    if node_id:
+        cfg.sweep.initial_random_seed = cfg.sweep.initial_random_seed + node_id * cfg.sweep.runs_batch_size
+
     seeds = [cfg.sweep.initial_random_seed + i for i in range(cfg.sweep.runs_batch_size)]
     hydra_cfg = HydraConfig.get()
     # Local-only label for the .err log line and pool failure reporting (NOT a wandb group -- the
