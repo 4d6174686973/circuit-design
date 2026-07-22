@@ -628,7 +628,8 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
             wandb_run=run,
             dataset_kind=cfg.data.dataset,
             valid_patterns=(dataloader.dataset.binary if cfg.data.dataset == "BAS" else None),
-            baseline_circuit=linear_circuit, baseline_params=linear_params)
+            baseline_circuit=linear_circuit, baseline_params=linear_params,
+            baseline_seed=cfg.sweep.initial_random_seed)
 
         # Save model + checkpoint
         qcbm.save(save_dir)

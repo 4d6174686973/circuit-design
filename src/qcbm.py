@@ -60,17 +60,23 @@ class QCBM:
         self.model_selection_metric: str = "mmd_val"
         self.total_measurements: int = 0  # cumulative circuit measurements over training
 
-    def _run_binds(self, stack: np.ndarray, N_shots: int, circuit=None) -> list:
+    def _run_binds(self, stack: np.ndarray, N_shots: int, circuit=None, seed_simulator=None) -> list:
         """Run a (n, P) stack of parameter sets and return a list of n count dicts.
 
         Uses Aer's native parameter_binds fast path when available (simulation), else falls back to
         a single 2D-parameter PUB through the SamplerV2 primitive (hardware). `circuit` defaults to
         self.circuit; pass a different one to sample e.g. the linear baseline circuit.
+        `seed_simulator` overrides the backend's configured RNG seed for THIS run only (used to pin
+        the step-0 baseline to a fixed seed so it is identical across connectivities); Aer fast path
+        only -- ignored on the hardware primitive path.
         """
         circuit = circuit if circuit is not None else self.circuit
         if self.use_parameter_binds:
             binds = {p: stack[:, p.index] for p in circuit.parameters}
-            result = self.sampler.run(circuit, parameter_binds=[binds], shots=N_shots).result()
+            run_kwargs = {"shots": N_shots}
+            if seed_simulator is not None:
+                run_kwargs["seed_simulator"] = int(seed_simulator)
+            result = self.sampler.run(circuit, parameter_binds=[binds], **run_kwargs).result()
             counts = result.get_counts()
             return counts if isinstance(counts, list) else [counts]
         # primitive path (hardware): one PUB with a 2D parameter array
@@ -80,13 +86,14 @@ class QCBM:
         flat = meas.reshape(n) if meas.shape else meas
         return [flat[i].get_counts() for i in range(n)] if meas.shape else [meas.get_counts()]
 
-    def sample(self, N_shots: int, circuit=None, params: np.ndarray = None) -> dict:
+    def sample(self, N_shots: int, circuit=None, params: np.ndarray = None, seed_simulator=None) -> dict:
         '''Generates samples from a circuit at given parameters. Defaults to self.circuit at
-        self.parameters; pass both to sample an arbitrary circuit instead (e.g. the linear baseline).'''
+        self.parameters; pass both to sample an arbitrary circuit instead (e.g. the linear baseline).
+        seed_simulator pins the RNG seed for this run (see _run_binds).'''
         circuit = circuit if circuit is not None else self.circuit
         params = params if params is not None else self.parameters
         stack = np.asarray(params).reshape(1, circuit.num_parameters)
-        return self._run_binds(stack, N_shots, circuit=circuit)[0]
+        return self._run_binds(stack, N_shots, circuit=circuit, seed_simulator=seed_simulator)[0]
 
     def param_shift_sampling(self, parameter_values: np.ndarray, shift: float, N_shots: int = 10000) -> tuple:
         """ Parameter-shift sampling for gradient computation.
@@ -132,21 +139,23 @@ class QCBM:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             return np.array(list(executor.map(grad_i, range(n))))
 
-    def _log_baseline_step(self, baseline_circuit, baseline_params, N_shots: int,
+    def _log_baseline_step(self, baseline_circuit, baseline_params, baseline_seed, N_shots: int,
                            T_train, T_train_probs, T_val, T_val_probs, sigmas: np.ndarray,
                            dataset_kind: str, valid_patterns, X_train_count: dict,
-                           X_test_count: dict, wandb_run, logger) -> int:
+                           X_test_count: dict, wandb_run, logger) -> None:
         """Sample the shared LINEAR, UNEXTENDED circuit and log it as step 0 (see the
         baseline_circuit/baseline_params docstring on stochastic_gradient_descent). Mutates
         self.losses/self.test_bench_hist exactly like a training-iteration eval step, but is not a
-        selectable checkpoint. Returns the step_offset (1: training iterations start at step 1;
-        0: no baseline given, training starts at step 0)."""
-        if baseline_circuit is None or baseline_params is None:
-            return 0
+        selectable checkpoint. Always runs -- the baseline is mandatory (step 0 is always the linear
+        reference); training iterations are then logged at steps 1..iterations.
 
+        The baseline is sampled with a FIXED seed (baseline_seed, the sweep's global
+        initial_random_seed) rather than the per-run seed, so -- since every connectivity shares the
+        same linear circuit -- step 0 is bit-identical across all of them (no per-run shot noise)."""
         from src.benchmark import evaluate  # local import avoids any import-time cycle with setup
 
-        B_counts = self.sample(N_shots, circuit=baseline_circuit, params=baseline_params)
+        B_counts = self.sample(N_shots, circuit=baseline_circuit, params=baseline_params,
+                               seed_simulator=baseline_seed)
         B, B_probs = sample_info(B_counts)
         b_train = cost_mmd_pre(T_train, T_train_probs, B, B_probs, sigmas)
         b_val = cost_mmd_pre(T_val, T_val_probs, B, B_probs, sigmas) if T_val is not None else np.nan
@@ -165,7 +174,6 @@ class QCBM:
                     "mmd_train": b_train, "mmd_val": b_val}
             log0.update(b_bench)
             wandb_run.log(log0, step=0)
-        return 1
 
     def stochastic_gradient_descent(
             self, X_train: np.ndarray, X_train_count: dict, X_val_count: dict, X_test_count: dict,
@@ -173,7 +181,7 @@ class QCBM:
             loss_func: str = 'MMD', sigmas: list = [1.0],
             eval_every: int = 1, model_selection_metric: str = 'mmd_val', wandb_run=None,
             dataset_kind: str = None, valid_patterns: np.ndarray = None,
-            baseline_circuit=None, baseline_params: np.ndarray = None):
+            *, baseline_circuit, baseline_params: np.ndarray, baseline_seed: int):
         """ Stochastic Gradient Descent with parameter-shift / finite-difference sampling.
 
         The train/validation/test splits are supplied by the caller (computed once upstream) so the
@@ -189,12 +197,14 @@ class QCBM:
         JGB. This logging is skipped (no test/* keys, no test_bench_hist rows) whenever the test
         split is empty (e.g. val_size + train_size == 1).
 
-        baseline_circuit/baseline_params (optional): the shared LINEAR, UNEXTENDED circuit and its
-        parameters. When given, its sampling output is evaluated with the same metric suite and
-        logged at wandb step 0 (cumulative_measurements=0) -- a common pre-training reference point
-        for every connectivity, since they all start from this same circuit. The first training
-        iteration is then step 1. The baseline is a reference only: it is NOT a checkpoint of this
-        (extended) circuit and never participates in model selection.
+        baseline_circuit/baseline_params/baseline_seed (REQUIRED, keyword-only): the shared LINEAR,
+        UNEXTENDED circuit, its parameters, and the FIXED sampling seed (the sweep's global
+        initial_random_seed). Its sampling output is evaluated with the same metric suite and logged
+        at wandb step 0 (cumulative_measurements=0) -- a common pre-training reference point for
+        every connectivity. Because the circuit is shared and the seed is fixed (not the per-run
+        seed), step 0 is bit-identical across all connectivities. Step 0 is ALWAYS this baseline;
+        the first training iteration is step 1. The baseline is a reference only: it is NOT a
+        checkpoint of this (extended) circuit and never participates in model selection.
         """
 
         logger = logging.getLogger('QCBM')
@@ -222,14 +232,14 @@ class QCBM:
 
         measurements_per_step = (2 * self.circuit.num_parameters + 1) * N_shots
 
-        # Step 0 baseline: sample the shared LINEAR, UNEXTENDED circuit (common to every
-        # connectivity) so all runs share a pre-training reference point at step 0. Training
-        # iterations are then logged at steps 1..iterations (step_offset=1); with no baseline,
-        # training starts at step 0 (step_offset=0). Not a selectable checkpoint (different circuit
-        # than self.circuit), so it is excluded from model selection.
-        step_offset = self._log_baseline_step(
-            baseline_circuit, baseline_params, N_shots, T_train, T_train_probs, T_val, T_val_probs,
-            sigmas, dataset_kind, valid_patterns, X_train_count, X_test_count, wandb_run, logger)
+        # Step 0 is ALWAYS the shared LINEAR, UNEXTENDED circuit (common to every connectivity), so
+        # all runs share a pre-training reference point. Training iterations are then logged at
+        # steps 1..iterations. Not a selectable checkpoint (different circuit than self.circuit), so
+        # it is excluded from model selection.
+        self._log_baseline_step(
+            baseline_circuit, baseline_params, baseline_seed, N_shots, T_train, T_train_probs,
+            T_val, T_val_probs, sigmas, dataset_kind, valid_patterns, X_train_count, X_test_count,
+            wandb_run, logger)
 
         # Training loop
         for it in range(iterations):
@@ -272,9 +282,9 @@ class QCBM:
             self.parameters = self.parameters + param_update
             self.parameter_hist.append(self.parameters.copy())
 
-            # Logged step: step 0 is the linear-baseline reference (when present), so training
-            # iteration `it` is step it + step_offset. step 1 == the first training iteration.
-            step = it + step_offset
+            # Logged step: step 0 is the linear-baseline reference, so training iteration `it` is
+            # logged at step it + 1. step 1 == the first training iteration.
+            step = it + 1
 
             # Evaluate held-out losses (every eval_every iterations and on the final iteration)
             do_eval = (it % eval_every == 0) or (it == iterations - 1)
@@ -298,8 +308,8 @@ class QCBM:
             # Model selection: keep the checkpoint (pre-update params) with the best metric. Test-set
             # metrics are deliberately NOT selectable here -- using the held-out test split to pick a
             # checkpoint would leak it into model selection, defeating its purpose as a clean,
-            # touched-once evaluation set. best_iter is the logged step (it + step_offset), so it
-            # indexes the same step where this checkpoint's metrics appear.
+            # touched-once evaluation set. best_iter is the logged step (it + 1), so it indexes the
+            # same step where this checkpoint's metrics appear.
             if do_eval:
                 sel = {"mmd_train": mmd_train, "mmd_val": mmd_val}[model_selection_metric]
                 if np.isfinite(sel) and sel < self.best_metric:
