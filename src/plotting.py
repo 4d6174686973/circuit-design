@@ -113,9 +113,10 @@ def default_colors(legend_keys) -> dict:
 
 
 def _save(fig, plots_dir, filename):
-    os.makedirs(plots_dir, exist_ok=True)
-    fig.savefig(f"{plots_dir}/{filename}.pdf", bbox_inches="tight", transparent=True)
-    fig.savefig(f"{plots_dir}/{filename}.png", bbox_inches="tight", transparent=False, dpi=300)
+    path = f"{plots_dir}/{filename}"
+    os.makedirs(os.path.dirname(path), exist_ok=True)  # filename may itself contain "/"
+    fig.savefig(f"{path}.pdf", bbox_inches="tight", transparent=True)
+    fig.savefig(f"{path}.png", bbox_inches="tight", transparent=False, dpi=300)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -452,8 +453,10 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
           f"{', '.join(str(k) for k in grouped)}")
     for metric in metrics:
         print(f"[plotting]     plotting {metric} vs. measurements (bootstrap over seeds)...")
+        # metric names may contain "/" (e.g. "test/mmd"); flatten to "_" so the filename doesn't
+        # imply a nested directory that was never created (plots_dir itself is the only dir made).
         plot_mmd_vs_measurements(grouped, metric=metric, n_boot=n_boot,
-                                 filename=f"{metric}_measurements", plots_dir=plots_dir)
+                                 filename=f"{metric.replace('/', '_')}_measurements", plots_dir=plots_dir)
     print("[plotting]     done.")
 
     # 2) benchmark figures: evaluate every run's best checkpoint, then bootstrap across seeds
