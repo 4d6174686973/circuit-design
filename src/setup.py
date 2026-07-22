@@ -591,6 +591,14 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
         # Shared MPS (trained once upstream; cache hit here)
         circuit_mps = get_or_train_mps(cfg, X_train)
 
+        # Linear (unextended) baseline: the shared pre-extension starting point common to EVERY
+        # connectivity. Compose it now, before setup_circuit_extensions -- extend_circuit mutates
+        # circuit_mps in place (appends the extension gates), so this must be captured first.
+        # compose_parameterized_circuit copies internally, so circuit_mps stays pristine for the
+        # extension step below. Sampled at step 0 in training for a common baseline across runs.
+        linear_circuit, linear_params = compose_parameterized_circuit(circuit_mps)
+        linear_circuit.measure_all()
+
         # Circuit extensions
         circuit_ext, init_params = setup_circuit_extensions(cfg, circuit_mps, X_train)
 
@@ -600,9 +608,10 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
         with open(f"{save_dir}/ext_circuit.qpy", "wb") as file:
             qpy.dump(circuit_ext, file)
 
-        # Transpile only for the real-device backend
+        # Transpile only for the real-device backend (both the training circuit and the baseline)
         if cfg.ibm.simulator == "aer_kawasaki":
             circuit = transpile_circuit(circuit_ext, "service")
+            linear_circuit = transpile_circuit(linear_circuit, "service")
         else:
             circuit = circuit_ext.copy()
 
@@ -618,7 +627,8 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
             eval_every=cfg.qcbm.eval_every, model_selection_metric=cfg.qcbm.model_selection_metric,
             wandb_run=run,
             dataset_kind=cfg.data.dataset,
-            valid_patterns=(dataloader.dataset.binary if cfg.data.dataset == "BAS" else None))
+            valid_patterns=(dataloader.dataset.binary if cfg.data.dataset == "BAS" else None),
+            baseline_circuit=linear_circuit, baseline_params=linear_params)
 
         # Save model + checkpoint
         qcbm.save(save_dir)

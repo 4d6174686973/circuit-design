@@ -60,28 +60,33 @@ class QCBM:
         self.model_selection_metric: str = "mmd_val"
         self.total_measurements: int = 0  # cumulative circuit measurements over training
 
-    def _run_binds(self, stack: np.ndarray, N_shots: int) -> list:
+    def _run_binds(self, stack: np.ndarray, N_shots: int, circuit=None) -> list:
         """Run a (n, P) stack of parameter sets and return a list of n count dicts.
 
         Uses Aer's native parameter_binds fast path when available (simulation), else falls back to
-        a single 2D-parameter PUB through the SamplerV2 primitive (hardware).
+        a single 2D-parameter PUB through the SamplerV2 primitive (hardware). `circuit` defaults to
+        self.circuit; pass a different one to sample e.g. the linear baseline circuit.
         """
+        circuit = circuit if circuit is not None else self.circuit
         if self.use_parameter_binds:
-            binds = {p: stack[:, p.index] for p in self.circuit.parameters}
-            result = self.sampler.run(self.circuit, parameter_binds=[binds], shots=N_shots).result()
+            binds = {p: stack[:, p.index] for p in circuit.parameters}
+            result = self.sampler.run(circuit, parameter_binds=[binds], shots=N_shots).result()
             counts = result.get_counts()
             return counts if isinstance(counts, list) else [counts]
         # primitive path (hardware): one PUB with a 2D parameter array
-        result = self.sampler.run([(self.circuit, stack)], shots=N_shots).result()[0]
+        result = self.sampler.run([(circuit, stack)], shots=N_shots).result()[0]
         meas = result.data.meas
         n = stack.shape[0]
         flat = meas.reshape(n) if meas.shape else meas
         return [flat[i].get_counts() for i in range(n)] if meas.shape else [meas.get_counts()]
 
-    def sample(self, N_shots: int) -> dict:
-        '''Generates samples from the quantum circuit at the current parameters'''
-        stack = self.parameters.reshape(1, self.circuit.num_parameters)
-        return self._run_binds(stack, N_shots)[0]
+    def sample(self, N_shots: int, circuit=None, params: np.ndarray = None) -> dict:
+        '''Generates samples from a circuit at given parameters. Defaults to self.circuit at
+        self.parameters; pass both to sample an arbitrary circuit instead (e.g. the linear baseline).'''
+        circuit = circuit if circuit is not None else self.circuit
+        params = params if params is not None else self.parameters
+        stack = np.asarray(params).reshape(1, circuit.num_parameters)
+        return self._run_binds(stack, N_shots, circuit=circuit)[0]
 
     def param_shift_sampling(self, parameter_values: np.ndarray, shift: float, N_shots: int = 10000) -> tuple:
         """ Parameter-shift sampling for gradient computation.
@@ -127,12 +132,48 @@ class QCBM:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             return np.array(list(executor.map(grad_i, range(n))))
 
+    def _log_baseline_step(self, baseline_circuit, baseline_params, N_shots: int,
+                           T_train, T_train_probs, T_val, T_val_probs, sigmas: np.ndarray,
+                           dataset_kind: str, valid_patterns, X_train_count: dict,
+                           X_test_count: dict, wandb_run, logger) -> int:
+        """Sample the shared LINEAR, UNEXTENDED circuit and log it as step 0 (see the
+        baseline_circuit/baseline_params docstring on stochastic_gradient_descent). Mutates
+        self.losses/self.test_bench_hist exactly like a training-iteration eval step, but is not a
+        selectable checkpoint. Returns the step_offset (1: training iterations start at step 1;
+        0: no baseline given, training starts at step 0)."""
+        if baseline_circuit is None or baseline_params is None:
+            return 0
+
+        from src.benchmark import evaluate  # local import avoids any import-time cycle with setup
+
+        B_counts = self.sample(N_shots, circuit=baseline_circuit, params=baseline_params)
+        B, B_probs = sample_info(B_counts)
+        b_train = cost_mmd_pre(T_train, T_train_probs, B, B_probs, sigmas)
+        b_val = cost_mmd_pre(T_val, T_val_probs, B, B_probs, sigmas) if T_val is not None else np.nan
+        b_bench = {}
+        if len(X_test_count):
+            b_bench = evaluate(B_counts, {"test": X_test_count}, dataset_kind, sigmas=sigmas,
+                               valid_patterns=valid_patterns, train_patterns=X_train_count)
+            self.test_bench_hist.append({"iteration": 0, **b_bench})
+        self.losses["mmd_train"].append(b_train)
+        self.losses["mmd_val"].append(b_val)
+        logger.info(f"| Step 0 baseline (linear, unextended) | Train MMD = {np.round(b_train, 6)} "
+                    f"| Val MMD = {np.round(b_val, 6)}")
+        if wandb_run is not None:
+            log0 = {"iteration": 0, "cumulative_measurements": 0, "measurements_per_step": 0,
+                    "num_parameters": self.circuit.num_parameters,
+                    "mmd_train": b_train, "mmd_val": b_val}
+            log0.update(b_bench)
+            wandb_run.log(log0, step=0)
+        return 1
+
     def stochastic_gradient_descent(
             self, X_train: np.ndarray, X_train_count: dict, X_val_count: dict, X_test_count: dict,
             iterations: int, N_shots: int, mmd_batch_size: int = 0,
             loss_func: str = 'MMD', sigmas: list = [1.0],
             eval_every: int = 1, model_selection_metric: str = 'mmd_val', wandb_run=None,
-            dataset_kind: str = None, valid_patterns: np.ndarray = None):
+            dataset_kind: str = None, valid_patterns: np.ndarray = None,
+            baseline_circuit=None, baseline_params: np.ndarray = None):
         """ Stochastic Gradient Descent with parameter-shift / finite-difference sampling.
 
         The train/validation/test splits are supplied by the caller (computed once upstream) so the
@@ -147,6 +188,13 @@ class QCBM:
         valid_patterns scopes the BAS-only extras (coverage/spurious_mass/gen/*); it is ignored for
         JGB. This logging is skipped (no test/* keys, no test_bench_hist rows) whenever the test
         split is empty (e.g. val_size + train_size == 1).
+
+        baseline_circuit/baseline_params (optional): the shared LINEAR, UNEXTENDED circuit and its
+        parameters. When given, its sampling output is evaluated with the same metric suite and
+        logged at wandb step 0 (cumulative_measurements=0) -- a common pre-training reference point
+        for every connectivity, since they all start from this same circuit. The first training
+        iteration is then step 1. The baseline is a reference only: it is NOT a checkpoint of this
+        (extended) circuit and never participates in model selection.
         """
 
         logger = logging.getLogger('QCBM')
@@ -173,6 +221,15 @@ class QCBM:
         T_val, T_val_probs = sample_info(X_val_count) if len(X_val_count) else (None, None)
 
         measurements_per_step = (2 * self.circuit.num_parameters + 1) * N_shots
+
+        # Step 0 baseline: sample the shared LINEAR, UNEXTENDED circuit (common to every
+        # connectivity) so all runs share a pre-training reference point at step 0. Training
+        # iterations are then logged at steps 1..iterations (step_offset=1); with no baseline,
+        # training starts at step 0 (step_offset=0). Not a selectable checkpoint (different circuit
+        # than self.circuit), so it is excluded from model selection.
+        step_offset = self._log_baseline_step(
+            baseline_circuit, baseline_params, N_shots, T_train, T_train_probs, T_val, T_val_probs,
+            sigmas, dataset_kind, valid_patterns, X_train_count, X_test_count, wandb_run, logger)
 
         # Training loop
         for it in range(iterations):
@@ -215,6 +272,10 @@ class QCBM:
             self.parameters = self.parameters + param_update
             self.parameter_hist.append(self.parameters.copy())
 
+            # Logged step: step 0 is the linear-baseline reference (when present), so training
+            # iteration `it` is step it + step_offset. step 1 == the first training iteration.
+            step = it + step_offset
+
             # Evaluate held-out losses (every eval_every iterations and on the final iteration)
             do_eval = (it % eval_every == 0) or (it == iterations - 1)
             test_bench = {}
@@ -227,7 +288,7 @@ class QCBM:
                     test_bench = evaluate(S_counts, {"test": X_test_count}, dataset_kind,
                                           sigmas=sigmas, valid_patterns=valid_patterns,
                                           train_patterns=X_train_count)
-                    self.test_bench_hist.append({"iteration": it, **test_bench})
+                    self.test_bench_hist.append({"iteration": step, **test_bench})
             else:
                 mmd_train = mmd_val = np.nan
             self.losses["mmd_train"].append(mmd_train)
@@ -237,18 +298,19 @@ class QCBM:
             # Model selection: keep the checkpoint (pre-update params) with the best metric. Test-set
             # metrics are deliberately NOT selectable here -- using the held-out test split to pick a
             # checkpoint would leak it into model selection, defeating its purpose as a clean,
-            # touched-once evaluation set.
+            # touched-once evaluation set. best_iter is the logged step (it + step_offset), so it
+            # indexes the same step where this checkpoint's metrics appear.
             if do_eval:
                 sel = {"mmd_train": mmd_train, "mmd_val": mmd_val}[model_selection_metric]
                 if np.isfinite(sel) and sel < self.best_metric:
                     self.best_metric = float(sel)
-                    self.best_iter = it
+                    self.best_iter = step
                     self.best_params = params_snapshot
 
             # wandb logging (cumulative_measurements every step for the MMD-vs-measurements x-axis)
             if wandb_run is not None:
                 log = {
-                    "iteration": it,
+                    "iteration": step,
                     "measurements_per_step": measurements_per_step,
                     "cumulative_measurements": self.total_measurements,
                     "num_parameters": self.circuit.num_parameters,
@@ -262,7 +324,7 @@ class QCBM:
                     # full test-set benchmark suite: test/mmd, test/kl, test/tv, test/fidelity, plus
                     # BAS coverage/spurious_mass/gen/* when applicable
                     log.update(test_bench)
-                wandb_run.log(log, step=it)
+                wandb_run.log(log, step=step)
 
             # Final logging
             logger.info(f"| Total = {np.round(grad_time - start_time, 2)} s | Sampling = {np.round(sample_time - start_time, 2)} s | Gradient = {np.round(grad_time - sample_time, 2)} s | Loss = {np.round(loss_time - grad_time, 2)} s")
