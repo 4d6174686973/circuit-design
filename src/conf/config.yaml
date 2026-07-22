@@ -42,7 +42,7 @@ qcbm:
   mmd_batch_size: 1000            # 0 for using the full train set or positive integer for MMD mini-batch size
   N_shots: 1000                   # number of shots in sampling
   loss_func: MMD                  # MMD, KL (KL not working yet)
-  sigmas: [1.0]                   # Bandwidth for MMD Kernel
+  sigmas: [0.25, 1.0, 4.0, 16.0]                   # Bandwidth for MMD Kernel
   finite_diff_epsilon: 1.0e-8     # epsilon used in finite difference sampling for KL (does not work yet)
   adam_learning_rate: 0.01        # initial learning rate for ADAM
   eval_every: 1                   # compute full train/val/test MMD every k iterations (+ final)
