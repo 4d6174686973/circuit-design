@@ -38,19 +38,19 @@ circuit:
 
 ### QCBM setup ###
 qcbm:
-  iterations: 100                 # number of training iterations
+  iterations: 10000               # number of training iterations
   mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
   N_shots: 5000                   # number of shots in sampling
   loss_func: MMD                  # MMD, KL (KL not working yet)
   sigmas: [0.25, 1.0, 4.0, 16.0]  # Bandwidth for MMD Kernel
   finite_diff_epsilon: 1.0e-8     # epsilon used in finite difference sampling for KL (does not work yet)
   adam_learning_rate: 0.01        # initial learning rate for ADAM
-  eval_every: 10                 # compute full train/val/test MMD every k iterations (+ final)
+  eval_every: 1                   # compute full train/val/test MMD every k iterations (+ final)
   model_selection_metric: mmd_val # metric used to pick the best checkpoint (mmd_val recommended)
 
 ### Sweep / batching ###
 sweep:
-  runs_batch_size: 64               # number of auto-seeded training runs per hydra job (seeds)
+  runs_batch_size: 32               # number of auto-seeded training runs per hydra job (seeds)
   initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
   gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
   max_parallel_runs: 0             # concurrent training runs across the whole sweep (0 = auto)
