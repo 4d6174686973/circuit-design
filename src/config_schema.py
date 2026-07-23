@@ -64,7 +64,7 @@ class CircuitConfig:
 @dataclass
 class QcbmConfig:
     iterations: int = 10                   # number of training iterations
-    mmd_batch_size: int = 1000             # 0 for using the full train set or positive integer for MMD mini-batch size
+    mmd_batch_fraction: float = 0.0        # 0 = full train set; (0,1] = that FRACTION of the train set per step
     N_shots: int = 1000                    # number of shots in sampling
     loss_func: str = "MMD"                 # MMD, KL (KL not working yet)
     sigmas: List[float] = field(default_factory=lambda: [1.0])  # Bandwidth for MMD Kernel
@@ -76,19 +76,9 @@ class QcbmConfig:
 
 @dataclass
 class SweepConfig:
-    # initial_random_seed is the ONLY seed you set. runs_batch_size auto-seeded runs are spawned per
-    # hydra job, each derived as initial_random_seed + i (i = 0 .. runs_batch_size-1) and logged as
-    # the run's effective seed.
     runs_batch_size: int = 1               # number of auto-seeded training runs per hydra job (seeds)
     initial_random_seed: int = 42          # base seed; run i in a batch uses initial_random_seed + i
     gpus_per_node: int = 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
-
-    # CPU parallelism budget for the whole sweep. All (grid combo x seed) runs share one global
-    # process pool sized by these, so the entire --multirun runs concurrently up to the hardware
-    # limit -- not one grid combo at a time. Both default to 0 = auto: max_parallel_runs is then
-    # min(total_runs, n_cpus) and threads_per_run is n_cpus // max_parallel_runs, so few runs each
-    # get many threads (fast sampling) and many runs trade threads for run-level parallelism.
-    # See src/setup.py::plan_resources.
     max_parallel_runs: int = 0             # concurrent training runs across the whole sweep (0 = auto)
     threads_per_run: int = 0               # OMP/BLAS/Aer/gradient threads per run (0 = auto, resolved at runtime)
 
@@ -103,6 +93,7 @@ class LoggingConfig:
     wandb_project: str = "qcbm-circuit-design"
     wandb_entity: Optional[str] = None     # null = your default wandb entity
     wandb_mode: str = "online"             # online, offline, disabled
+    log_level: str = "INFO"                # INFO (verbose, default) or WARNING (quiet -- real/production runs)
 
 
 @dataclass

@@ -151,20 +151,20 @@ def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "circui
     return grouped
 
 
-def fetch_history(run, metric: str = "mmd_train") -> pd.DataFrame:
-    """Per-run dataframe with cumulative_measurements and the requested metric (NaN rows dropped)."""
-    keys = ["cumulative_measurements", metric]
+def fetch_history(run, metric: str = "train/mmd_train") -> pd.DataFrame:
+    """Per-run dataframe with train/cumulative_measurements and the requested metric (NaN rows dropped)."""
+    keys = ["train/cumulative_measurements", metric]
     df = run.history(keys=keys, pandas=True)
     if df is None or df.empty or metric not in df:
         # fallback: reconstruct measurements from config if not logged
         cfg = from_run_config(run.config)
         n = cfg.qcbm.iterations
-        P = run.summary.get("num_parameters") or run.config.get("num_parameters", 0)
+        P = run.summary.get("train/num_parameters") or run.config.get("num_parameters", 0)
         shots = cfg.qcbm.N_shots
         per = (2 * P + 1) * shots
-        df = pd.DataFrame({"cumulative_measurements": np.arange(1, n + 1) * per,
+        df = pd.DataFrame({"train/cumulative_measurements": np.arange(1, n + 1) * per,
                            metric: [np.nan] * n})
-    return df.dropna(subset=[metric]).sort_values("cumulative_measurements")
+    return df.dropna(subset=[metric]).sort_values("train/cumulative_measurements")
 
 
 def aggregate_over_measurements(histories: list, metric: str, mode: str = "bootstrap",
@@ -183,13 +183,13 @@ def aggregate_over_measurements(histories: list, metric: str, mode: str = "boots
     curves = [h for h in histories if len(h) > 0]
     if not curves:
         return None
-    lo = max(c["cumulative_measurements"].min() for c in curves)
-    hi = min(c["cumulative_measurements"].max() for c in curves)
+    lo = max(c["train/cumulative_measurements"].min() for c in curves)
+    hi = min(c["train/cumulative_measurements"].max() for c in curves)
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         return None
     grid = np.linspace(lo, hi, n_grid)
     stacked = np.vstack([
-        np.interp(grid, c["cumulative_measurements"].values, c[metric].values) for c in curves
+        np.interp(grid, c["train/cumulative_measurements"].values, c[metric].values) for c in curves
     ])
     if mode == "bootstrap":
         line, std = bootstrap_mean_std(stacked, n_boot=n_boot, seed=boot_seed)  # across-run SE
@@ -208,7 +208,7 @@ def aggregate_over_measurements(histories: list, metric: str, mode: str = "boots
     return {"x": grid, "line": line, "lower": lower, "upper": upper, "n_runs": len(curves)}
 
 
-def plot_mmd_vs_measurements(runs_by_key: dict, metric: str = "mmd_train", mode: str = "bootstrap",
+def plot_mmd_vs_measurements(runs_by_key: dict, metric: str = "train/mmd_train", mode: str = "bootstrap",
                              window: int = 1, n_boot: int = 1000, colors: dict = None,
                              filename: str = "MMD_measurements", plots_dir: str = "plots",
                              save: bool = True):
@@ -246,7 +246,7 @@ def bootstrap_group_metrics(per_run_df: pd.DataFrame, group_by: str = "circuit.e
     `per_run_df` is the tidy one-row-per-run table from benchmark.benchmark_all_runs (a `group_by`
     column plus numeric metric columns). For each group and metric, resample the group's runs with
     replacement n_boot times and report the mean and the std of the bootstrap means (the across-seed
-    standard error), via utils.bootstrap_mean_std. Non-finite per-run values (e.g. gen/* for a
+    standard error), via utils.bootstrap_mean_std. Non-finite per-run values (e.g. bench_val/* for a
     full_support run) are dropped before resampling.
 
     Returns one row per group with, for each metric <m>, a column <m> (bootstrap mean) and <m>_std
@@ -298,8 +298,9 @@ def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by
     if bench_df is None or bench_df.empty:
         return None
     if metric_cols is None:
-        metric_cols = [c for c in ["test/mmd", "test/tv", "test/fidelity",
-                                   "gen/validity", "gen/coverage", "gen/fidelity", "gen/rate"]
+        metric_cols = [c for c in ["bench_dist/test/mmd", "bench_dist/test/tv", "bench_dist/test/fidelity",
+                                   "bench_val/coverage", "bench_val/fidelity", "bench_val/rate",
+                                   "bench_BAS/precision", "bench_BAS/recall", "bench_BAS/qbas"]
                        if c in bench_df]
     metric_cols = [c for c in metric_cols if c in bench_df]
     if not metric_cols:
@@ -328,15 +329,19 @@ def plot_metric_table(bench_df: pd.DataFrame, metric_cols: list = None, group_by
 
 
 def plot_generalization_bars(bench_df: pd.DataFrame, group_by: str = "circuit.extension",
-                             metrics=("gen/validity", "gen/coverage", "gen/fidelity", "gen/rate"),
+                             metrics=("bench_val/coverage", "bench_val/fidelity", "bench_val/rate"),
                              plots_dir: str = "plots", filename: str = "generalization_metrics",
                              colors: dict = None, save: bool = True):
     """Grouped bar chart of the Gili et al. validity-based generalization metrics.
 
-    One bar cluster per metric (validity, coverage, fidelity, rate), one bar per group (extension).
-    Only draws metrics present in bench_df; returns None when none are present or all values are NaN
-    -- i.e. for JGB sweeps or BAS `full_support` sweeps, where these metrics are undefined (they
-    require training on a strict subset of the valid space, i.e. bas_split_mode=holdout).
+    One bar cluster per metric (coverage, fidelity, rate), one bar per group (extension).
+    Computed for both BAS and JGB (see benchmark.generalization_metrics); only draws metrics present
+    in bench_df, returning None when none are present or all values are NaN -- i.e. for BAS
+    `full_support` sweeps, where the unseen valid space is empty and every metric is undefined
+    (these metrics require training on a strict subset of the valid space, i.e.
+    bas_split_mode=holdout). For JGB, `fidelity` is trivially 1.0 and `rate` collapses to
+    `exploration` -- every bitstring decodes to a valid value, so only `exploration`/`coverage`
+    carry signal there.
 
     Sources: Gili, Mauri & Perdomo-Ortiz, arXiv:2207.13645 (Quantum Sci. Technol. 8, 035021, 2023);
     Gili et al., Phys. Rev. Applied 21, 044032 (2024), arXiv:2201.08770.
@@ -426,7 +431,7 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
 # orchestrator
 # --------------------------------------------------------------------------------------------------
 def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: dict,
-                         group_by: str = "circuit.extension", metrics=("mmd_train", "test/mmd"),
+                         group_by: str = "circuit.extension", metrics=("train/mmd_train", "bench_dist/test/mmd"),
                          plots_dir: str = "plots", science_style: bool = True, n_boot: int = 1000):
     """Generate the training-dependent figure set for a sweep: metric-vs-measurements curves +
     bootstrap benchmark (metric table, and QQ grids for JGB). Both the curves and the benchmark
@@ -453,8 +458,8 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
           f"{', '.join(str(k) for k in grouped)}")
     for metric in metrics:
         print(f"[plotting]     plotting {metric} vs. measurements (bootstrap over seeds)...")
-        # metric names may contain "/" (e.g. "test/mmd"); flatten to "_" so the filename doesn't
-        # imply a nested directory that was never created (plots_dir itself is the only dir made).
+        # metric names may contain "/" (e.g. "bench_dist/test/mmd"); flatten to "_" so the filename
+        # doesn't imply a nested directory that was never created (plots_dir is the only dir made).
         plot_mmd_vs_measurements(grouped, metric=metric, n_boot=n_boot,
                                  filename=f"{metric.replace('/', '_')}_measurements", plots_dir=plots_dir)
     print("[plotting]     done.")
@@ -468,9 +473,9 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
         print("[plotting]     no per-run metrics; falling back to best-per-group point estimate.")
         bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by)
     plot_metric_table(bench_df, group_by=group_by, plots_dir=plots_dir)
-    if dataset == "BAS":
-        # Gili et al. generalization bars (no-op unless the sweep used bas_split_mode=holdout)
-        plot_generalization_bars(bench_df, group_by=group_by, plots_dir=plots_dir)
+    # Gili et al. generalization bars: computed for both datasets (no-op if bench_val/* columns are
+    # absent or all-NaN, e.g. a BAS full_support sweep -- see plot_generalization_bars docstring)
+    plot_generalization_bars(bench_df, group_by=group_by, plots_dir=plots_dir)
     if dataset == "JGB":
         plot_qq_grid(sweep_id, entity, project, group_by, plots_dir=plots_dir)
     print("[plotting]     done.")
@@ -497,7 +502,7 @@ def _parse_args(argv=None):
     parser.add_argument("--group-by", default="circuit.extension",
                         help="Dot-separated config key to use as the plot legend/grouping dimension "
                              "(default: circuit.extension; can be any swept key).")
-    parser.add_argument("--metrics", nargs="+", default=["mmd_train", "test/mmd"],
+    parser.add_argument("--metrics", nargs="+", default=["train/mmd_train", "bench_dist/test/mmd"],
                         help="Logged metrics to plot vs. cumulative measurements.")
     parser.add_argument("--n-boot", type=int, default=1000,
                         help="Bootstrap resamples for the across-seed mean/SE (curves + benchmark).")

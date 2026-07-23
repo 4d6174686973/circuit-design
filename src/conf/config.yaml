@@ -38,27 +38,21 @@ circuit:
 
 ### QCBM setup ###
 qcbm:
-  iterations: 10                  # number of training iterations
-  mmd_batch_size: 1000            # 0 for using the full train set or positive integer for MMD mini-batch size
+  iterations: 100                 # number of training iterations
+  mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
   N_shots: 5000                   # number of shots in sampling
   loss_func: MMD                  # MMD, KL (KL not working yet)
-  sigmas: [0.25, 1.0, 4.0, 16.0]                   # Bandwidth for MMD Kernel
+  sigmas: [0.25, 1.0, 4.0, 16.0]  # Bandwidth for MMD Kernel
   finite_diff_epsilon: 1.0e-8     # epsilon used in finite difference sampling for KL (does not work yet)
   adam_learning_rate: 0.01        # initial learning rate for ADAM
-  eval_every: 1                   # compute full train/val/test MMD every k iterations (+ final)
+  eval_every: 100                 # compute full train/val/test MMD every k iterations (+ final)
   model_selection_metric: mmd_val # metric used to pick the best checkpoint (mmd_val recommended)
 
 ### Sweep / batching ###
-# initial_random_seed is the ONLY seed you set. runs_batch_size auto-seeded runs are spawned per
-# hydra job, each derived as initial_random_seed + i (i = 0 .. runs_batch_size-1) and logged as the
-# run's effective seed -- there is no separate "random_seed" to set or accidentally collide on.
 sweep:
-  runs_batch_size: 1               # number of auto-seeded training runs per hydra job (seeds)
+  runs_batch_size: 64               # number of auto-seeded training runs per hydra job (seeds)
   initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
   gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
-  # CPU parallelism budget shared across the WHOLE --multirun (all grid combos x seeds run at once,
-  # not one combo at a time). Both 0 = auto: max_parallel_runs = min(total_runs, n_cpus),
-  # threads_per_run = n_cpus // max_parallel_runs. See src/setup.py::plan_resources.
   max_parallel_runs: 0             # concurrent training runs across the whole sweep (0 = auto)
   threads_per_run: 0               # OMP/BLAS/Aer/gradient threads per run (0 = auto)
 
@@ -67,3 +61,4 @@ logging:
   wandb_project: qcbm-circuit-design
   wandb_entity: null              # null = your default wandb entity
   wandb_mode: online              # online, offline, disabled
+  log_level: WARNING              # INFO (verbose, default) or WARNING (quiet -- real/production runs)

@@ -118,6 +118,25 @@ uv run --no-sync python -m src --multirun "${OVERRIDES[@]}"
 
 echo ">>> [Run] Task ${TASK_ID} finished successfully."
 
+# --- Upload offline wandb runs (no-op in online mode) ---------------------------------------------
+# With logging.wandb_mode=offline each run is written to ./wandb/offline-run-* on the shared
+# filesystem instead of streamed live -- the recommended mode for large sweeps, since streaming
+# hundreds of concurrent runs trips wandb's per-project filestream rate limit (HTTP 429), which
+# stalls logging, backs up memory, and can take runs (and the whole process pool) down. Now that
+# training is done we upload them in one pass. Notes:
+#   * `wandb sync` marks each run dir synced, so already-synced runs (and re-invocations) are
+#     skipped -- and it's a harmless no-op when there are no offline runs (i.e. online mode).
+#   * Guarded with `|| ...`: training already succeeded, so a transient upload error must NOT fail
+#     the job (set -e) -- offline runs persist on disk and can always be synced again by hand.
+#   * Multi-node arrays share one ./wandb dir; each task syncs what's present. The per-run synced
+#     marker keeps concurrent tasks from re-uploading each other's already-synced runs.
+if compgen -G "wandb/offline-run-*" > /dev/null 2>&1; then
+    echo ">>> [Sync] Uploading offline wandb runs to the server..."
+    uv run --no-sync wandb sync --sync-all \
+        || echo ">>> [Sync] WARNING: 'wandb sync' failed; sync later with: uv run wandb sync --sync-all"
+    echo ">>> [Sync] Done."
+fi
+
 # ==============================================================================
 # GPU support -- FUTURE WORK (this launcher is CPU-only)
 # ==============================================================================

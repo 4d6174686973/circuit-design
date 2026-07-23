@@ -77,18 +77,35 @@ def negative_log_likelihood(samples: dict, target_samples: np.ndarray, eps: floa
 # --------------------------------------------------------------------------------------------------
 # BAS-specific metrics (discrete finite support)
 # --------------------------------------------------------------------------------------------------
-def mode_coverage(samples: dict, valid_patterns: np.ndarray) -> float:
-    """Fraction of valid BAS patterns that receive nonzero model mass (mode-collapse detector)."""
-    valid = set(array_to_str(valid_patterns))
-    seen = set(samples.keys()) & valid
-    return float(len(seen) / len(valid))
+def qbas_metrics(samples: dict, valid_patterns: np.ndarray) -> dict:
+    """Precision/recall/F1 against the FULL valid BAS pattern space (not just the unseen subset).
 
-
-def spurious_mass(samples: dict, valid_patterns: np.ndarray) -> float:
-    """Total model probability placed on bitstrings that are not valid bars/stripes patterns."""
+    Standard discrete BAS benchmark protocol (Benedetti, Garcia-Pintos, Perdomo-Ortiz et al.,
+    "A generative modeling approach for benchmarking and training shallow quantum circuits", npj
+    Quantum Inf. 5, 45, 2019): precision is the fraction of generated samples (with multiplicity)
+    that land on a valid bars-and-stripes pattern, recall is the fraction of the enumerated valid
+    patterns hit at least once, and the qBAS score is their harmonic mean (F1). Unlike
+    generalization_metrics (bench_val/*), this scores against the WHOLE valid space and never
+    references the training set.
+    """
     valid = set(array_to_str(valid_patterns))
-    Q = to_prob_dict(samples)
-    return float(sum(p for k, p in Q.items() if k not in valid))
+    nan = float("nan")
+    Q = sum(samples.values())
+    if Q == 0 or not valid:
+        return {"bench_BAS/precision": nan, "bench_BAS/recall": nan, "bench_BAS/qbas": nan}
+
+    q_valid = 0
+    hit = set()
+    for bitstring, c in samples.items():
+        if bitstring in valid:
+            q_valid += c
+            hit.add(bitstring)
+
+    precision = q_valid / Q
+    recall = len(hit) / len(valid)
+    qbas = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else nan
+    return {"bench_BAS/precision": float(precision), "bench_BAS/recall": float(recall),
+            "bench_BAS/qbas": float(qbas)}
 
 
 # --------------------------------------------------------------------------------------------------
@@ -102,9 +119,13 @@ def spurious_mass(samples: dict, valid_patterns: np.ndarray) -> float:
 #     arXiv:2201.08770.
 #
 # These measure a model trained on a STRICT SUBSET of the valid solution space by how well it
-# generates unseen-yet-valid samples (true generalization, not memorization). They are therefore
-# only defined for the BAS `holdout` split (train subset of valid space); under `full_support`
-# (train == valid space) there is no unseen valid space and everything but `validity` is NaN.
+# generates unseen-yet-valid samples (true generalization, not memorization). For BAS,
+# valid_patterns is the enumerated bars/stripes support (well-defined only under the `holdout`
+# split; under `full_support`, train == valid space, so there is no unseen valid space and every
+# metric is NaN). For JGB there is no separate notion of "valid" bitstring --
+# every bit pattern decodes to some real value under the fixed-point encoding -- so valid_patterns
+# is left None and the full 2^n bitstring hypercube is used as the valid space instead (n = the
+# bitstring length, inferred from the samples; never materialized, only its size is used).
 # --------------------------------------------------------------------------------------------------
 def _to_bitstring_set(patterns) -> set:
     """Normalize a pattern container to a set of bitstrings.
@@ -123,7 +144,7 @@ def _to_bitstring_set(patterns) -> set:
     return set(array_to_str(np.atleast_2d(arr)))
 
 
-def generalization_metrics(samples: dict, train_patterns, valid_patterns) -> dict:
+def generalization_metrics(samples: dict, train_patterns, valid_patterns=None) -> dict:
     """Validity-based generalization metrics for constraint-satisfaction generative models.
 
     Following Gili, Mauri & Perdomo-Ortiz (arXiv:2207.13645) and Gili et al. (Phys. Rev. Applied 21,
@@ -134,46 +155,59 @@ def generalization_metrics(samples: dict, train_patterns, valid_patterns) -> dic
     training set, G_sol the queries that are valid AND outside the training set, g_sol the number of
     UNIQUE unseen-valid bitstrings generated, S the valid solution space and T the training-set size:
 
-        validity    = (# queries landing in S) / Q            fraction of samples that are valid
         exploration = |G_new| / Q                             fraction of samples that are novel
         fidelity    = |G_sol| / |G_new|                       precision: novel samples that are valid
         rate        = |G_sol| / Q      (= exploration*fidelity)   efficiency of useful generation
         coverage    = g_sol / (|S| - T)                       recall of the unseen valid space
 
     Counts are with multiplicity except `coverage` (unique bitstrings). Returns keys prefixed
-    "gen/" to disambiguate `gen/fidelity` (this precision measure) from `test/fidelity`
-    (the Bhattacharyya distribution fidelity). Metrics are NaN when their denominator is empty
-    (Q=0, no novel samples, or no unseen valid space under `full_support`).
+    "bench_val/" (Gili et al. generalization suite; distinct from the bench_BAS/* precision-recall
+    pair and the bench_dist/* distribution distances, which include a separate `fidelity` --
+    Bhattacharyya distribution fidelity, not this precision measure). Metrics are NaN when their
+    denominator is empty (Q=0, no novel samples, or no unseen valid space under BAS `full_support`).
+
+    valid_patterns=None (JGB): every bitstring is valid, so S is the full 2^n hypercube (n = the
+    bitstring length) rather than an enumerated finite set -- `fidelity` is then trivially 1.0
+    (nothing generated can be invalid) and `rate` collapses to `exploration`; the non-trivial signal
+    for JGB is `exploration`/`coverage`, i.e. how much of the encoding's unseen resolution the model
+    reaches beyond the finite training sample.
     """
     train_set = _to_bitstring_set(train_patterns)
-    valid_set = _to_bitstring_set(valid_patterns)
-    unseen_valid = valid_set - train_set
-
     nan = float("nan")
     Q = sum(samples.values())
     if Q == 0:
-        return {"gen/validity": nan, "gen/exploration": nan, "gen/fidelity": nan,
-                "gen/rate": nan, "gen/coverage": nan}
+        return {"bench_val/exploration": nan, "bench_val/fidelity": nan,
+                "bench_val/rate": nan, "bench_val/coverage": nan}
 
-    q_valid = q_new = q_sol = 0
+    if valid_patterns is None:
+        n_bits = len(next(iter(samples)))
+        unseen_size = 2 ** n_bits - len(train_set)
+
+        def is_valid(_bitstring):
+            return True
+    else:
+        valid_set = _to_bitstring_set(valid_patterns)
+        unseen_size = len(valid_set - train_set)
+
+        def is_valid(bitstring):
+            return bitstring in valid_set
+
+    q_new = q_sol = 0
     unique_sol = set()
     for bitstring, c in samples.items():
-        is_valid = bitstring in valid_set
+        valid = is_valid(bitstring)
         is_new = bitstring not in train_set
-        if is_valid:
-            q_valid += c
         if is_new:
             q_new += c
-        if is_valid and is_new:
+        if valid and is_new:
             q_sol += c
             unique_sol.add(bitstring)
 
     return {
-        "gen/validity": float(q_valid / Q),
-        "gen/exploration": float(q_new / Q),
-        "gen/fidelity": float(q_sol / q_new) if q_new > 0 else nan,
-        "gen/rate": float(q_sol / Q),
-        "gen/coverage": float(len(unique_sol) / len(unseen_valid)) if unseen_valid else nan,
+        "bench_val/exploration": float(q_new / Q),
+        "bench_val/fidelity": float(q_sol / q_new) if q_new > 0 else nan,
+        "bench_val/rate": float(q_sol / Q),
+        "bench_val/coverage": float(len(unique_sol) / unseen_size) if unseen_size else nan,
     }
 
 
@@ -268,24 +302,28 @@ def evaluate(samples: dict, splits: dict, dataset_kind: str, sigmas=np.array([1.
         samples: model sample counts {bitstring: count}
         splits: {split_name: target_count_dict}, e.g. {"val": ..., "test": ...}
         dataset_kind: "BAS" or "JGB"
-        valid_patterns: enumerated valid BAS patterns (required for BAS coverage/spurious mass)
-        train_patterns: seen (training-split) patterns as a Counter/ndarray; when supplied together
-            with valid_patterns for BAS, the Gili et al. validity-based generalization metrics
-            (gen/*) are added, computed against the held-out unseen valid space (valid \\ train).
+        valid_patterns: enumerated valid BAS patterns (BAS only -- used by both bench_val and
+            bench_BAS below); None for JGB, where bench_val instead treats every bitstring as
+            valid (see generalization_metrics).
+        train_patterns: seen (training-split) patterns as a Counter/ndarray; when supplied, the
+            Gili et al. bench_val/* generalization metrics are computed for BOTH dataset kinds
+            (BAS against the enumerated valid space, JGB against the full bitstring hypercube).
+
+    Returns bench_dist/<split>/{mmd,kl,tv,fidelity} for every non-empty split, bench_val/* (all
+    datasets, whenever train_patterns is given), and -- BAS only -- bench_BAS/{precision,recall,qbas}.
     """
     metrics = {}
     for name, target in splits.items():
         if not target:
             continue
-        metrics[f"{name}/mmd"] = mmd(samples, target, sigmas)
-        metrics[f"{name}/kl"] = kl_divergence(samples, target)
-        metrics[f"{name}/tv"] = total_variation_distance(samples, target)
-        metrics[f"{name}/fidelity"] = classical_fidelity(samples, target)
+        metrics[f"bench_dist/{name}/mmd"] = mmd(samples, target, sigmas)
+        metrics[f"bench_dist/{name}/kl"] = kl_divergence(samples, target)
+        metrics[f"bench_dist/{name}/tv"] = total_variation_distance(samples, target)
+        metrics[f"bench_dist/{name}/fidelity"] = classical_fidelity(samples, target)
+    if train_patterns is not None:
+        metrics.update(generalization_metrics(samples, train_patterns, valid_patterns))
     if dataset_kind == "BAS" and valid_patterns is not None:
-        metrics["coverage"] = mode_coverage(samples, valid_patterns)
-        metrics["spurious_mass"] = spurious_mass(samples, valid_patterns)
-        if train_patterns is not None:
-            metrics.update(generalization_metrics(samples, train_patterns, valid_patterns))
+        metrics.update(qbas_metrics(samples, valid_patterns))
     return metrics
 
 
@@ -301,8 +339,12 @@ def select_best_run(runs: list, metric: str = "best_mmd_val"):
     return min(scored, key=lambda rs: rs[1])[0]
 
 
-def load_checkpoint(run, root: str = "./artifacts"):
-    """Download a run's model artifact and load (circuit, best_params).
+def load_checkpoint(run, root: str = "./artifacts", which: str = "best"):
+    """Download a run's model artifact and load (circuit, params).
+
+    `which` selects "best" (validation-selected, default) or "final" (last training iteration) --
+    see QCBM.save, which persists both checkpoints (best_params.npy / final_params.npy) alongside
+    the circuit in every run's model artifact.
 
     Skips the download entirely -- including the network round-trip to fetch/verify the artifact
     manifest -- if both expected files are already present locally under root/run.id. Safe here
@@ -310,9 +352,11 @@ def load_checkpoint(run, root: str = "./artifacts"):
     src/setup.py::setup_and_train_qcbm), so there is no newer version a stale local copy could miss.
     """
     from qiskit import qpy
+    if which not in ("best", "final"):
+        raise ValueError(f"which must be 'best' or 'final', got {which!r}")
     local_dir = f"{root}/{run.id}"
     circuit_path = f"{local_dir}/circuit.qpy"
-    params_path = f"{local_dir}/best_params.npy"
+    params_path = f"{local_dir}/{which}_params.npy"
 
     if os.path.exists(circuit_path) and os.path.exists(params_path):
         print(f"[benchmark]     [{run.id}] checkpoint already downloaded, reusing {local_dir}")
@@ -328,8 +372,8 @@ def load_checkpoint(run, root: str = "./artifacts"):
 
     with open(circuit_path, "rb") as f:
         circuit = qpy.load(f)[0]
-    best_params = np.load(params_path)
-    return circuit, best_params
+    params = np.load(params_path)
+    return circuit, params
 
 
 def sample_model(circuit, params: np.ndarray, n_shots: int, seed: int = 0) -> dict:
@@ -368,8 +412,8 @@ def _test_split_for_config(cfg) -> tuple:
 def _evaluate_run(run, n_shots: int) -> dict:
     """Load one run's best checkpoint, sample it, and evaluate the full held-out test metric suite.
 
-    Returns the flat metric dict from `evaluate` (test/mmd, test/kl, test/tv, test/fidelity, plus
-    BAS coverage/spurious_mass/gen*). Shared by benchmark_sweep (best-per-group) and
+    Returns the flat metric dict from `evaluate` (bench_dist/test/{mmd,kl,tv,fidelity}, bench_val/*,
+    plus BAS-only bench_BAS/{precision,recall,qbas}). Shared by benchmark_sweep (best-per-group) and
     benchmark_all_runs (every run) so a run is scored identically regardless of caller.
     """
     circuit, params = load_checkpoint(run)

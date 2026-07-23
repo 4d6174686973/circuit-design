@@ -490,7 +490,7 @@ def _init_wandb(cfg: DictConfig, sweep_id: str):
     )
 
 
-def _configure_worker_logging(output_dir: str, seed: int) -> None:
+def _configure_worker_logging(output_dir: str, seed: int, log_level: str = "INFO") -> None:
     """Configure logging inside a (possibly spawned) worker process.
 
     ProcessPoolExecutor's default "spawn" start method (used on macOS/Windows, and available on
@@ -498,7 +498,14 @@ def _configure_worker_logging(output_dir: str, seed: int) -> None:
     config — hydra's INFO-level setup only exists in the parent, so without this, every
     logger.info() call in a parallel (runs_batch_size > 1) run is silently dropped below WARNING.
     When train_worker is instead called directly in the parent process (runs_batch_size == 1, no
-    pool), the "QCBM" logger already inherits hydra's INFO level, so this is a no-op.
+    pool), the "QCBM" logger already inherits hydra's INFO level from that setup instead.
+
+    `log_level` (cfg.logging.log_level) is the single config-driven verbosity control for the
+    "QCBM" logger -- the only logger every module in this codebase logs through -- so setting it
+    here is enough to quiet (e.g. "WARNING", for real/production sweeps) or restore ("INFO") every
+    training log line, in EITHER process (parent or spawned worker): the isEnabledFor(INFO) probe
+    just below runs BEFORE this is applied, so it still correctly detects "parent (hydra already
+    configured)" vs "fresh spawned worker" regardless of which level was actually requested.
 
     We check/configure the "QCBM" logger specifically (not root): some imported library (observed:
     wandb) attaches its own handler to the root logger even in a fresh spawned process, so
@@ -510,10 +517,11 @@ def _configure_worker_logging(output_dir: str, seed: int) -> None:
     log file under the run's output directory, so training progress is always visible somewhere.
     """
     logger = logging.getLogger("QCBM")
-    if logger.isEnabledFor(logging.INFO):
-        return  # INFO already reaches a handler (e.g. hydra configured this in the parent process)
+    already_configured = logger.isEnabledFor(logging.INFO)
+    logger.setLevel(getattr(logging, log_level.upper()))
+    if already_configured:
+        return  # a handler already exists (e.g. hydra configured this in the parent process)
 
-    logger.setLevel(logging.INFO)
     logger.propagate = False  # avoid double/mis-formatted output via whatever root already has
 
     formatter = logging.Formatter(
@@ -542,10 +550,9 @@ def train_worker(cfg_container: dict, seed: int, worker_index: int, combo: str, 
     non-pooled call), cap Aer's own thread pool via cfg.sweep.threads_per_run
     (see setup_qiskit_simulator), and size the gradient ThreadPoolExecutor to match.
     """
-    _configure_worker_logging(output_dir, seed)
-
     cfg = OmegaConf.create(cfg_container)
     cfg.sweep.random_seed = seed
+    _configure_worker_logging(output_dir, seed, cfg.logging.log_level)
 
     # GPU NOTE: round-robin GPU pinning is stubbed here; CPU sweeps leave gpus_per_node=0. A real
     # GPU mode would also skip the CPU thread-capping below (a GPU run wants full BLAS for its host
@@ -622,7 +629,7 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
                     use_parameter_binds=use_parameter_binds)
         qcbm.stochastic_gradient_descent(
             X_train, X_train_count, X_val_count, X_test_count,
-            cfg.qcbm.iterations, cfg.qcbm.N_shots, cfg.qcbm.mmd_batch_size,
+            cfg.qcbm.iterations, cfg.qcbm.N_shots, cfg.qcbm.mmd_batch_fraction,
             cfg.qcbm.loss_func, cfg.qcbm.sigmas,
             eval_every=cfg.qcbm.eval_every, model_selection_metric=cfg.qcbm.model_selection_metric,
             wandb_run=run,
@@ -635,12 +642,6 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
         qcbm.save(save_dir)
 
         # Upload artifact and record best-model summary for the selection step.
-        # Only circuit.qpy + best_params.npy are uploaded: they're the sole files needed to
-        # reconstruct/sample the best checkpoint (src/benchmark.py::load_checkpoint) and aren't
-        # representable as wandb scalar metrics. Everything else `qcbm.save()` writes locally
-        # (losses.parquet, checkpoint_meta.json, full params.npy history) duplicates data already
-        # logged as wandb metrics/summary/config (mmd_train/val/test, best_mmd_val, best_iter,
-        # total_measurements, num_parameters, ...) and is not re-uploaded.
         if run is not None:
             import wandb
             run.summary["best_mmd_val"] = qcbm.best_metric
@@ -650,6 +651,7 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
                                       metadata={"seed": cfg.sweep.random_seed, "combo": combo})
             artifact.add_file(f"{save_dir}/circuit.qpy")
             artifact.add_file(f"{save_dir}/best_params.npy")
+            artifact.add_file(f"{save_dir}/final_params.npy")
             run.log_artifact(artifact, aliases=[f"seed{cfg.sweep.random_seed}"])
 
         logger.info("Program finished")
