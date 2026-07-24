@@ -51,7 +51,7 @@ qcbm:
 
 ### Sweep / batching ###
 sweep:
-  runs_batch_size: 32               # number of auto-seeded training runs per hydra job (seeds)
+  runs_batch_size: 16               # number of auto-seeded training runs per hydra job (seeds)
   initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
   gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
   max_parallel_runs: 0             # concurrent training runs across the whole sweep (0 = auto)
