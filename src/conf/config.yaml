@@ -39,7 +39,7 @@ circuit:
 
 ### QCBM setup ###
 qcbm:
-  iterations: 5000               # number of training iterations
+  iterations: 1000               # number of training iterations
   mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
   N_shots: 2000                   # number of shots in sampling
   loss_func: MMD                  # MMD, KL (KL not working yet)
