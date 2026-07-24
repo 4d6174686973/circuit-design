@@ -59,6 +59,7 @@ class CircuitConfig:
     extension: str = "metric_based"        # none, all_to_all, nearest_neighbor, metric_based, chow_liu, random
     extension_metric: str = "hamming"      # hamming, varinfo
     threshold_rule: str = "knee"           # knee, percolation -- how metric_based auto-selects its threshold
+    threshold: Optional[float] = None      # explicit metric_based threshold; overrides threshold_rule unless None
 
 
 @dataclass

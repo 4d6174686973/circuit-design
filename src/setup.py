@@ -178,13 +178,14 @@ def get_or_train_mps(cfg: DictConfig, X_train: np.ndarray) -> QuantumCircuit:
             return qpy.load(file)[0]
     return train_mps(cfg, X_train, cache_dir)
 
-def _metric_based_connections(X_train: pd.DataFrame, extension_metric: str, threshold_rule: str) -> tuple:
-    """Distance matrix + auto-selected threshold (knee or percolation rule) + the resulting
-    metric_based edges. Shared by the metric_based and random branches of
-    setup_circuit_extensions -- random is sized to match this exactly, so it's a fair random
-    baseline for that comparison."""
+def _metric_based_connections(X_train: pd.DataFrame, extension_metric: str, threshold_rule: str,
+                              threshold: float = None) -> tuple:
+    """Distance matrix + threshold + the resulting metric_based edges. The threshold is the explicit
+    cfg.circuit.threshold if set, otherwise auto-selected via threshold_rule (knee or percolation).
+    Shared by the metric_based and random branches of setup_circuit_extensions -- random is sized to
+    match this exactly, so it's a fair random baseline for that comparison."""
     dist = feature_distance_matrix(X_train, extension_metric)
-    threshhold = select_threshold(dist, threshold_rule)
+    threshhold = threshold if threshold is not None else select_threshold(dist, threshold_rule)
     return metric_based_topology(dist, threshhold), threshhold
 
 
@@ -196,6 +197,7 @@ def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_tra
     extension = cfg.circuit.extension
     extension_metric = cfg.circuit.extension_metric
     threshold_rule = cfg.circuit.threshold_rule
+    threshold = cfg.circuit.threshold
     width = cfg.data.width
     height = cfg.data.height
     random_seed = cfg.sweep.random_seed
@@ -230,8 +232,9 @@ def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_tra
     # threshold (extension.percolation_threshold) -- rather than hand-tuned, so it adapts to the
     # dataset/metric.
     elif extension == "metric_based":
-        extension_connections, threshhold = _metric_based_connections(X_train, extension_metric, threshold_rule)
-        logger.info(f"metric_based ({extension_metric}) auto-threshold @ {threshold_rule} = {threshhold:.4f}")
+        extension_connections, threshhold = _metric_based_connections(X_train, extension_metric, threshold_rule, threshold)
+        source = "explicit" if threshold is not None else f"auto @ {threshold_rule}"
+        logger.info(f"metric_based ({extension_metric}) threshold ({source}) = {threshhold:.4f}")
         extended_circuit = extend_circuit(mps_circuit, init_connections, extension_connections)
 
     # chow-liu dependency-tree extension: the maximum-mutual-information spanning tree over the
@@ -246,7 +249,7 @@ def setup_circuit_extensions(cfg: DictConfig, mps_circuit: QuantumCircuit, X_tra
     # (same dataset/metric), so it's a fair random baseline for that comparison rather than an
     # arbitrarily chosen count.
     elif extension == "random":
-        metric_connections, _ = _metric_based_connections(X_train, extension_metric, threshold_rule)
+        metric_connections, _ = _metric_based_connections(X_train, extension_metric, threshold_rule, threshold)
         n_random_extensions = len(set(metric_connections) - set(init_connections))
         logger.info(f"random extension: matching metric_based ({extension_metric}) connection "
                     f"count = {n_random_extensions}")
