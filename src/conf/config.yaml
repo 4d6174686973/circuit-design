@@ -54,7 +54,14 @@ sweep:
   runs_batch_size: 16               # number of auto-seeded training runs per hydra job (seeds)
   initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
   gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
-  max_parallel_runs: 0             # concurrent training runs across the whole sweep (0 = auto)
+  # Concurrent training runs across the whole sweep. Capped at 8 (not 0=auto=~all cores) because
+  # ONLINE wandb enforces a per-project rate limit on run-update/heartbeat requests: with ~100+
+  # concurrent online runs the limit throttles heartbeats, so wandb's server marks live runs
+  # "crashed" in the UI even though training is fine. ~8 concurrent runs keeps update traffic under
+  # that limit. For wandb_mode=offline/disabled there is no such limit -- override with
+  # sweep.max_parallel_runs=0 to use all cores. If wandb still flags runs crashed, lower this; if
+  # the dashboard stays healthy, raise it toward the node's core count.
+  max_parallel_runs: 8             # concurrent training runs (0 = auto ~= all cores; capped for online wandb)
   threads_per_run: 0               # OMP/BLAS/Aer/gradient threads per run (0 = auto)
 
 ### Logging ###
