@@ -39,7 +39,9 @@ circuit:
 
 ### QCBM setup ###
 qcbm:
-  iterations: 100               # number of training iterations
+  mode: iterations                # iterations, measurements
+  measurement_budget: 2e8         # 2e8; only used when mode=measurements
+  iterations: 100                 # number of training iterations; only when mode=iterations
   mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
   N_shots: 1000                   # number of shots in sampling
   loss_func: MMD                  # MMD, KL (KL not working yet)
@@ -62,7 +64,7 @@ logging:
   wandb_project: qcbm-circuit-design
   wandb_entity: null              # null = your default wandb entity
   wandb_mode: online              # online, offline, disabled
-  log_level: WARNING              # INFO (verbose, default) or WARNING (quiet -- real/production runs)
+  log_level: INFO              # INFO (verbose, default) or WARNING (quiet -- real/production runs)
 
   # --- wandb request-rate control (src/wandb_logging.py) ---
   wandb_flush_every: 10          # buffered iteration rows per push (1 = push every iteration)

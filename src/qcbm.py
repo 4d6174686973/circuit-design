@@ -14,6 +14,35 @@ from src.cost import adam, cost_mmd_pre, cost_grad_mmd_pre, cost_grad_kl_div
 from src.data import DataLoader
 
 
+def resolve_iterations(mode: str, iterations: int, measurement_budget: int,
+                       measurements_per_step: int) -> int:
+    """How many training iterations this run gets.
+
+    "iterations": fixed iteration count -- connectivities then consume different amounts of
+    quantum resources, since a step costs (2P+1)*N_shots and P grows with added connections.
+
+    "measurements": fixed measurement budget instead, so runs are compared at EQUAL quantum cost;
+    iterations = budget // per-step cost (a step that would exceed the budget is cut, never
+    partially run).
+
+    Either way the step-0 baseline doesn't consume the budget (see _log_baseline_step).
+    """
+    if mode == "iterations":
+        if iterations < 1:
+            raise ValueError(f"qcbm.iterations must be >= 1, got {iterations}")
+        return int(iterations)
+
+    if mode != "measurements":
+        raise ValueError(f"qcbm.mode must be 'iterations' or 'measurements', got {mode!r}")
+
+    if measurement_budget < measurements_per_step:
+        raise ValueError(
+            f"qcbm.measurement_budget ({measurement_budget:,}) does not cover a single training "
+            f"iteration of this circuit ({measurements_per_step:,} measurements = "
+            f"(2*P+1)*N_shots). Raise the budget, lower qcbm.N_shots, or use a smaller circuit.")
+    return int(measurement_budget // measurements_per_step)
+
+
 class QCBM:
     def __init__(
             self,
@@ -51,6 +80,10 @@ class QCBM:
         self.best_metric: float = np.inf
         self.model_selection_metric: str = "mmd_val"
         self.total_measurements: int = 0
+        # Run length actually used + its per-step cost; resolved in stochastic_gradient_descent, since
+        # under a measurement budget the iteration count depends on this circuit's parameter count.
+        self.iterations_run: int = 0
+        self.measurements_per_step: int = 0
         self._last_wandb_s: float = 0.0  # cost of the previous _log_step call (see _log_step)
 
     def _run_binds(self, stack: np.ndarray, N_shots: int, circuit=None, seed_simulator=None) -> list:
@@ -172,7 +205,7 @@ class QCBM:
         self.losses["mmd_train"].append(b_train)
         self.losses["mmd_val"].append(b_val)
         eval_time = time.time()
-        logger.info(f"| Step 0 baseline (linear, unextended) | Train MMD = {np.round(b_train, 6)} "
+        logger.debug(f"| Step 0 baseline (linear, unextended) | Train MMD = {np.round(b_train, 6)} "
                     f"| Val MMD = {np.round(b_val, 6)}")
         if wandb_run is not None:
             log0 = {"train/step": 0, "train/cumulative_measurements": 0,
@@ -191,6 +224,7 @@ class QCBM:
             loss_func: str = 'MMD', sigmas: list = [1.0],
             eval_every: int = 1, model_selection_metric: str = 'mmd_val', wandb_run=None,
             dataset_kind: str = None, valid_patterns: np.ndarray = None,
+            mode: str = 'iterations', measurement_budget: int = 0,
             *, baseline_circuit, baseline_params: np.ndarray, baseline_seed: int):
         """ Stochastic Gradient Descent with parameter-shift / finite-difference sampling.
 
@@ -211,6 +245,11 @@ class QCBM:
         connectivities -- bit-identical every run since circuit and seed are fixed. Step 0 is
         always this baseline (training starts at step 1); it's a reference only, never a checkpoint
         of this circuit, and never participates in model selection.
+
+        mode ('iterations' | 'measurements') selects what ends the run: a fixed iteration count, or as
+        many iterations as `measurement_budget` affords, so connectivities are compared at equal
+        quantum cost (see resolve_iterations). Only the run LENGTH changes -- logging is per training
+        iteration in both modes.
 
         wandb_run is a src.wandb_logging.WandbLogger (or None for no wandb logging). Every iteration
         is logged at its own step, but rows are buffered and pushed in chunks of
@@ -242,6 +281,20 @@ class QCBM:
 
         measurements_per_step = (2 * self.circuit.num_parameters + 1) * N_shots
 
+        # Run length: a fixed iteration count, or as many whole iterations as the measurement budget
+        # affords (see resolve_iterations). Recorded so save()/the caller can report the length that
+        # was actually used, which in 'measurements' mode is circuit-dependent.
+        iterations = resolve_iterations(mode, iterations, measurement_budget,
+                                        measurements_per_step)
+        self.iterations_run = iterations
+        self.measurements_per_step = measurements_per_step
+        budget_note = (f" (budget {measurement_budget:,} / {measurements_per_step:,} per step, "
+                       f"{measurement_budget - iterations * measurements_per_step:,} left unused)"
+                       if mode == "measurements" else "")
+        logger.info(f"Run length ({mode}): {iterations} iterations x "
+                    f"{measurements_per_step:,} measurements = "
+                    f"{iterations * measurements_per_step:,} total{budget_note}")
+
         # Resolve the MMD-target minibatch size once. 0 => full train set. (0,1] => that fraction,
         # rounded and clamped to [1, |X_train|]. Only subsamples the (classical) kernel target data --
         # the dominant cost is the (2P+1)*N_shots quantum sampling below, independent of batch size,
@@ -266,8 +319,8 @@ class QCBM:
         # Training loop
         for it in range(iterations):
 
-            logger.info(f" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ")
-            logger.info(f"| Iteration {it + 1} / {iterations}")
+            logger.debug(f" - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ")
+            logger.debug(f"| Iteration {it + 1} / {iterations}")
 
             # snapshot of the parameters that produce this iteration's samples S
             params_snapshot = self.parameters.copy()
@@ -359,9 +412,9 @@ class QCBM:
                 logging_s = 0.0
 
             # Final logging
-            logger.info(f"| Total = {np.round(total_s, 2)} s | Sampling = {np.round(sample_time - start_time, 2)} s | Gradient = {np.round(grad_time - sample_time, 2)} s | Eval = {np.round(eval_time - grad_time, 2)} s | Logging = {np.round(logging_s, 2)} s")
+            logger.debug(f"| Total = {np.round(total_s, 2)} s | Sampling = {np.round(sample_time - start_time, 2)} s | Gradient = {np.round(grad_time - sample_time, 2)} s | Eval = {np.round(eval_time - grad_time, 2)} s | Logging = {np.round(logging_s, 2)} s")
             test_mmd_str = f"{test_bench['bench_dist/test/mmd']:.6f}" if "bench_dist/test/mmd" in test_bench else "n/a"
-            logger.info(f"| MMD loss | Train = {np.round(mmd_train, 6)} | Val = {np.round(mmd_val, 6)} | Test = {test_mmd_str}")
+            logger.debug(f"| MMD loss | Train = {np.round(mmd_train, 6)} | Val = {np.round(mmd_val, 6)} | Test = {test_mmd_str}")
 
         # Push whatever is still buffered before the caller moves on to saving/artifact upload, so a
         # partially-filled last chunk isn't held until run.finish().
@@ -393,6 +446,10 @@ class QCBM:
                 "model_selection_metric": self.model_selection_metric,
                 "total_measurements": self.total_measurements,
                 "num_parameters": int(self.circuit.num_parameters),
+                # length actually run: under a measurement budget this is circuit-dependent, so it is
+                # not recoverable from qcbm.iterations in the config alone
+                "iterations_run": self.iterations_run,
+                "measurements_per_step": self.measurements_per_step,
             }, f, indent=2)
 
         with open(f"{save_dir}/circuit.qpy", 'wb') as file:

@@ -629,6 +629,8 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
             cfg.qcbm.iterations, cfg.qcbm.N_shots, cfg.qcbm.mmd_batch_fraction,
             cfg.qcbm.loss_func, cfg.qcbm.sigmas,
             eval_every=cfg.qcbm.eval_every, model_selection_metric=cfg.qcbm.model_selection_metric,
+            mode=cfg.qcbm.mode,
+            measurement_budget=cfg.qcbm.measurement_budget,
             wandb_run=wandb_run,
             dataset_kind=cfg.data.dataset,
             valid_patterns=(dataloader.dataset.binary if cfg.data.dataset == "BAS" else None),
@@ -644,6 +646,8 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
         wandb_run.summary({"best_mmd_val": qcbm.best_metric,
                            "best_iter": qcbm.best_iter,
                            "total_measurements": qcbm.total_measurements,
+                           "iterations_run": qcbm.iterations_run,
+                           "measurements_per_step": qcbm.measurements_per_step,
                            "save_dir": os.path.abspath(save_dir)})
 
         # Model artifact -- the heaviest per-run burst of API calls in a sweep (create + per-file

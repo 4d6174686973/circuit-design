@@ -156,12 +156,11 @@ def fetch_history(run, metric: str = "train/mmd_train") -> pd.DataFrame:
     keys = ["train/cumulative_measurements", metric]
     df = run.history(keys=keys, pandas=True)
     if df is None or df.empty or metric not in df:
-        # fallback: reconstruct measurements from config if not logged
         cfg = from_run_config(run.config)
-        n = cfg.qcbm.iterations
+        n = run.summary.get("iterations_run") or cfg.qcbm.iterations
         P = run.summary.get("train/num_parameters") or run.config.get("num_parameters", 0)
         shots = cfg.qcbm.N_shots
-        per = (2 * P + 1) * shots
+        per = run.summary.get("measurements_per_step") or (2 * P + 1) * shots
         df = pd.DataFrame({"train/cumulative_measurements": np.arange(1, n + 1) * per,
                            metric: [np.nan] * n})
     return df.dropna(subset=[metric]).sort_values("train/cumulative_measurements")

@@ -64,7 +64,9 @@ class CircuitConfig:
 
 @dataclass
 class QcbmConfig:
-    iterations: int = 10                   # number of training iterations
+    mode: str = "iterations"                 # iterations, measurements
+    measurement_budget: int = 1_000_000_000  # circuit measurements per run (mode=measurements)
+    iterations: int = 10                   # number of training iterations (mode=iterations)
     mmd_batch_fraction: float = 0.0        # 0 = full train set; (0,1] = that FRACTION of the train set per step
     N_shots: int = 1000                    # number of shots in sampling
     loss_func: str = "MMD"                 # MMD, KL (KL not working yet)
