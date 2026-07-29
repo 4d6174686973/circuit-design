@@ -67,13 +67,13 @@ logging:
   log_level: INFO                 # INFO (verbose, default) or WARNING (quiet -- real/production runs)
 
   # --- wandb request-rate control (src/wandb_logging.py) ---
-  wandb_flush_every: 50           # buffered iteration rows per push (1 = push every iteration)
-  wandb_flush_interval_s: 300.0   # also push if this long since the last push (slow-iteration runs)
-  wandb_transmit_interval_s: 60.0 # filestream transmit interval
+  wandb_flush_every: 10           # buffered iteration rows per push (1 = push every iteration)
+  wandb_flush_interval_s: 30.0   # also push if this long since the last push (slow-iteration runs)
+  wandb_transmit_interval_s: 20.0 # filestream transmit interval
   wandb_log_artifacts: true       # per-run model artifact upload (benchmark.py loads checkpoints from it)
 
   # --- wandb robustness (a 429 must never kill a training run) ---
-  wandb_init_stagger_s: 0.2       # init jitter window = this x sweep.max_parallel_runs seconds
+  wandb_init_stagger_s: 1.0       # init jitter window = this x sweep.max_parallel_runs seconds
   wandb_init_retries: 5           # extra wandb.init() attempts before training without wandb
   wandb_retry_max: 5              # retries for the wandb calls WE make (not wandb-core's internal
   wandb_retry_wait_max_s: 60.0    # HTTP retry budget -- shortening that drops run data mid-stream)
