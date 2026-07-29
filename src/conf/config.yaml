@@ -39,8 +39,8 @@ circuit:
 
 ### QCBM setup ###
 qcbm:
-  mode: iterations                # iterations, measurements
-  measurement_budget: 2e8         # 2e8; only used when mode=measurements
+  mode: measurements                # iterations, measurements
+  measurement_budget: 1e8         # 2e8; only used when mode=measurements
   iterations: 100                 # number of training iterations; only when mode=iterations
   mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
   N_shots: 1000                   # number of shots in sampling
@@ -53,7 +53,7 @@ qcbm:
 
 ### Sweep / batching ###
 sweep:
-  runs_batch_size: 16               # number of auto-seeded training runs per hydra job (seeds)
+  runs_batch_size: 16              # number of auto-seeded training runs per hydra job (seeds)
   initial_random_seed: 42          # base seed; run i in a batch uses initial_random_seed + i
   gpus_per_node: 0                 # >0 round-robins runs across GPUs via CUDA_VISIBLE_DEVICES; 0 = CPU mode
   max_parallel_runs: 0             # concurrent training runs (0 = auto ~= all cores)
@@ -64,21 +64,19 @@ logging:
   wandb_project: qcbm-circuit-design
   wandb_entity: null              # null = your default wandb entity
   wandb_mode: online              # online, offline, disabled
-  log_level: INFO              # INFO (verbose, default) or WARNING (quiet -- real/production runs)
+  log_level: INFO                 # INFO (verbose, default) or WARNING (quiet -- real/production runs)
 
   # --- wandb request-rate control (src/wandb_logging.py) ---
-  wandb_flush_every: 10          # buffered iteration rows per push (1 = push every iteration)
+  wandb_flush_every: 10           # buffered iteration rows per push (1 = push every iteration)
   wandb_flush_interval_s: 300.0   # also push if this long since the last push (slow-iteration runs)
-  wandb_transmit_interval_s: 60.0 # wandb-core filestream transmit interval (dashboard lag <= this)
-  wandb_heartbeat_s: 30           # run keepalive interval; raising it cuts the per-run request floor
-                                  # but risks the backend marking live runs crashed -- raise carefully
+  wandb_transmit_interval_s: 60.0 # filestream transmit interval
   wandb_log_artifacts: true       # per-run model artifact upload (benchmark.py loads checkpoints from it)
 
   # --- wandb robustness (a 429 must never kill a training run) ---
   wandb_init_stagger_s: 0.2       # init jitter window = this x sweep.max_parallel_runs seconds
   wandb_init_retries: 5           # extra wandb.init() attempts before training without wandb
-  wandb_retry_max: 5              # retries per wandb call (also wandb-core's own retry cap)
-  wandb_retry_wait_max_s: 60.0    # backoff cap for those retries
+  wandb_retry_max: 5              # retries for the wandb calls WE make (not wandb-core's internal
+  wandb_retry_wait_max_s: 60.0    # HTTP retry budget -- shortening that drops run data mid-stream)
   wandb_max_failures: 5           # consecutive failed pushes before dropping wandb for that run
   wandb_init_timeout_s: 300.0     # wandb.init() timeout (the 90s default is tight at high fan-out)
   wandb_service_wait_s: 120.0     # wait for the local wandb-core service (default 30s)

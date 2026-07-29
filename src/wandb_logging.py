@@ -20,8 +20,10 @@ Three levers are combined here so run-level parallelism can go up to the node's 
    large bursts instead of a trickle, so most of wandb-core's transmit ticks have nothing to send
    and issue no request at all.
 2. TUNED TRANSPORT (`build_settings`) -- a long filestream transmit interval (so one chunk becomes
-   ~one request instead of one request per tick), more retries with longer backoff on both the
-   filestream and GraphQL clients, and no system-stats/metadata traffic.
+   ~one request instead of one request per tick, and that interval is also the per-run request floor,
+   since the same channel carries the run's liveness), generous startup timeouts, and no
+   system-stats/metadata traffic. wandb-core's own HTTP retry budgets are left ALONE -- see the note
+   in build_settings for why shortening them drops run data.
 3. FAILURE TOLERANCE (`init_run`, `WandbLogger._attempt`) -- init is staggered across concurrent
    runs and retried with jittered exponential backoff, and every wandb call is wrapped so a 429 (or
    any other wandb error) degrades logging instead of killing training. After `max_failures`
@@ -85,16 +87,15 @@ def build_settings(cfg, sweep_id: str):
         # backend slower to answer, so give them more room than the 90s/30s defaults.
         "init_timeout": float(cfg.logging.wandb_init_timeout_s),
         "x_service_wait": float(cfg.logging.wandb_service_wait_s),
-        # Transmission: the interval is what turns a buffered chunk into ~one request. Raising it
-        # also means the dashboard lags by up to that much, which is acceptable at chunk granularity.
+        # Transmission: the interval is what turns a buffered chunk into ~one request, and it also
+        # sets the per-run request FLOOR -- the filestream posts periodically to keep the backend from
+        # marking a live run crashed, so liveness and data ride the same channel. Raising it means the
+        # dashboard lags by up to that much, which is fine at chunk granularity.
+        # (Settings.heartbeat_seconds is deliberately not set: in wandb-core every heartbeat code path
+        # belongs to `wandb leet`, the terminal UI, and the legacy Python filestream takes its
+        # keepalive period from the SERVER's dynamic settings, not from this field. It is not the knob
+        # it looks like.)
         "x_file_stream_transmit_interval": float(cfg.logging.wandb_transmit_interval_s),
-        "x_file_stream_retry_max": int(cfg.logging.wandb_retry_max),
-        "x_file_stream_retry_wait_max_seconds": float(cfg.logging.wandb_retry_wait_max_s),
-        "x_graphql_retry_max": int(cfg.logging.wandb_retry_max),
-        "x_graphql_retry_wait_max_seconds": float(cfg.logging.wandb_retry_wait_max_s),
-        # Keepalive that keeps the backend from marking a live run crashed. Raising it cuts the
-        # per-run request floor but risks the backend deciding the run died -- see config.yaml.
-        "heartbeat_seconds": int(cfg.logging.wandb_heartbeat_s),
     }
 
     fields = getattr(wandb.Settings, "model_fields", None)
@@ -358,7 +359,11 @@ class WandbLogger:
                 error = exc
                 if attempt == self._retries:
                     break
-                time.sleep(min(delay, self._retry_max_s) + self._rng.uniform(0.0, 1.0))
+                # Full jitter: sleep uniformly in [d, 2d] rather than d + up to 1s. Proportional
+                # jitter still de-synchronizes concurrent runs, and it keeps the knobs honest --
+                # retry_base_s=0 now really means "don't wait" (a fixed +1s made that impossible).
+                capped = min(delay, self._retry_max_s)
+                time.sleep(capped + self._rng.uniform(0.0, capped))
                 delay *= 2
         self._log.warning(f"[wandb:{self._label}] {what} failed after {self._retries + 1} "
                           f"attempt(s): {error!r}")

@@ -207,9 +207,6 @@ def feature_distance_matrix(X: np.ndarray, metric: str) -> np.ndarray:
 
 
 ### FOR PLOTTING RESULTS ###
-import matplotlib.pyplot as plt 
-
-
 def get_features_for_quasi_dist(samples_dict, bits_per_feature, num_features):
     sample_gen_arr, sample_gen_probs = sample_info(samples_dict)
     res_dicts = []
@@ -243,6 +240,7 @@ def plot_mmd_two_sets(data: dict, colors: dict, mode: str = "medperc", iter: int
     Returns:
     - fig: figure object
     """
+    import matplotlib.pyplot as plt
 
     losses = {'train': {}, 'test': {}}
     plot_data = {'train': {}, 'test': {}}
@@ -334,6 +332,7 @@ def plot_mmd_one_set(data: dict, colors: dict, evalset: str = "train", mode: str
     Returns:
     - fig: figure object
     """
+    import matplotlib.pyplot as plt
 
     losses = {evalset: {}}
     plot_data = {evalset: {}}

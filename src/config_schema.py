@@ -65,7 +65,9 @@ class CircuitConfig:
 @dataclass
 class QcbmConfig:
     mode: str = "iterations"                 # iterations, measurements
-    measurement_budget: int = 1_000_000_000  # circuit measurements per run (mode=measurements)
+    # float, not int, so budgets can be written in scientific notation (2e8) -- YAML parses that as a
+    # float and a strict int field would reject it. Only ever used as a floor divisor.
+    measurement_budget: float = 2e8          # circuit measurements per run (mode=measurements)
     iterations: int = 10                   # number of training iterations (mode=iterations)
     mmd_batch_fraction: float = 0.0        # 0 = full train set; (0,1] = that FRACTION of the train set per step
     N_shots: int = 1000                    # number of shots in sampling
@@ -101,15 +103,14 @@ class LoggingConfig:
     # --- wandb request-rate control (see src/wandb_logging.py) ---
     wandb_flush_every: int = 100           # buffered iteration rows per push (1 = push every iteration)
     wandb_flush_interval_s: float = 300.0  # also push if this long since the last push (slow runs)
-    wandb_transmit_interval_s: float = 60.0  # wandb-core filestream transmit interval
-    wandb_heartbeat_s: int = 30            # run keepalive interval; raising it cuts the request floor
+    wandb_transmit_interval_s: float = 60.0  # filestream transmit interval = per-run request floor
     wandb_log_artifacts: bool = True       # per-run model artifact upload (needed by benchmark.py)
 
     # --- wandb robustness ---
     wandb_init_stagger_s: float = 0.2      # init jitter window = this x sweep.max_parallel_runs
     wandb_init_retries: int = 5            # extra wandb.init() attempts before training without wandb
-    wandb_retry_max: int = 5               # retries per wandb call (also wandb-core's own retry cap)
-    wandb_retry_wait_max_s: float = 60.0   # backoff cap for those retries
+    wandb_retry_max: int = 5               # retries per wandb call we make (NOT wandb-core's own
+    wandb_retry_wait_max_s: float = 60.0   # HTTP retry budget -- never shorten that, see build_settings)
     wandb_max_failures: int = 5            # consecutive failed pushes before dropping wandb for a run
     wandb_init_timeout_s: float = 300.0    # wandb.init() timeout (default 90s is tight at high fan-out)
     wandb_service_wait_s: float = 120.0    # wait for the local wandb-core service (default 30s)
@@ -131,6 +132,18 @@ cs = ConfigStore.instance()
 cs.store(name="config_schema", node=Config)
 
 
+def _drop_unknown(schema, config: dict) -> dict:
+    """Recursively strip keys this schema no longer defines (see from_run_config)."""
+    kept = {}
+    for key, value in config.items():
+        if key not in schema:
+            continue
+        node = schema[key]
+        kept[key] = _drop_unknown(node, value) if isinstance(value, dict) and OmegaConf.is_dict(node) \
+            else value
+    return kept
+
+
 def from_run_config(config: dict) -> DictConfig:
     """Wrap a wandb run's logged config dict (from src.wandb_logging.init_run, itself
     OmegaConf.to_container(cfg, resolve=True)) back into this schema, so callers get the same dot
@@ -138,5 +151,12 @@ def from_run_config(config: dict) -> DictConfig:
 
     wandb's public API already strips its own internal keys (_wandb, wandb_version) from
     Run.config, so this only ever sees the fields we logged ourselves.
+
+    Fields that have since been REMOVED from the schema are dropped rather than fatal: a structured
+    merge rejects unknown keys, and callers (plotting.fetch_runs, benchmark._group_runs) respond by
+    skipping the whole run -- so deleting one config field would silently drop every already-finished
+    run from the plots. Missing (newly added) fields fall back to their schema defaults, so the
+    schema can evolve in both directions without invalidating past sweeps.
     """
-    return OmegaConf.merge(OmegaConf.structured(Config), config)
+    schema = OmegaConf.structured(Config)
+    return OmegaConf.merge(schema, _drop_unknown(schema, config))

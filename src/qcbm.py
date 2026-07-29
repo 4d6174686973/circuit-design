@@ -14,7 +14,7 @@ from src.cost import adam, cost_mmd_pre, cost_grad_mmd_pre, cost_grad_kl_div
 from src.data import DataLoader
 
 
-def resolve_iterations(mode: str, iterations: int, measurement_budget: int,
+def resolve_iterations(mode: str, iterations: int, measurement_budget: float,
                        measurements_per_step: int) -> int:
     """How many training iterations this run gets.
 
@@ -37,7 +37,7 @@ def resolve_iterations(mode: str, iterations: int, measurement_budget: int,
 
     if measurement_budget < measurements_per_step:
         raise ValueError(
-            f"qcbm.measurement_budget ({measurement_budget:,}) does not cover a single training "
+            f"qcbm.measurement_budget ({measurement_budget:,.0f}) does not cover a single training "
             f"iteration of this circuit ({measurements_per_step:,} measurements = "
             f"(2*P+1)*N_shots). Raise the budget, lower qcbm.N_shots, or use a smaller circuit.")
     return int(measurement_budget // measurements_per_step)
@@ -288,8 +288,8 @@ class QCBM:
                                         measurements_per_step)
         self.iterations_run = iterations
         self.measurements_per_step = measurements_per_step
-        budget_note = (f" (budget {measurement_budget:,} / {measurements_per_step:,} per step, "
-                       f"{measurement_budget - iterations * measurements_per_step:,} left unused)"
+        budget_note = (f" (budget {measurement_budget:,.0f} / {measurements_per_step:,} per step, "
+                       f"{measurement_budget - iterations * measurements_per_step:,.0f} left unused)"
                        if mode == "measurements" else "")
         logger.info(f"Run length ({mode}): {iterations} iterations x "
                     f"{measurements_per_step:,} measurements = "
