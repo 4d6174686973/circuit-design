@@ -40,10 +40,10 @@ circuit:
 ### QCBM setup ###
 qcbm:
   mode: measurements                # iterations, measurements
-  measurement_budget: 1e8         # 2e8; only used when mode=measurements
+  measurement_budget: 5e8         # 2e8; only used when mode=measurements
   iterations: 100                 # number of training iterations; only when mode=iterations
   mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
-  N_shots: 1000                   # number of shots in sampling
+  N_shots: 2000                   # number of shots in sampling
   loss_func: MMD                  # MMD, KL (KL not working yet)
   sigmas: [0.25, 1.0, 4.0, 16.0]  # Bandwidth for MMD Kernel
   finite_diff_epsilon: 1.0e-8     # epsilon used in finite difference sampling for KL (does not work yet)
@@ -67,7 +67,7 @@ logging:
   log_level: INFO                 # INFO (verbose, default) or WARNING (quiet -- real/production runs)
 
   # --- wandb request-rate control (src/wandb_logging.py) ---
-  wandb_flush_every: 10           # buffered iteration rows per push (1 = push every iteration)
+  wandb_flush_every: 50           # buffered iteration rows per push (1 = push every iteration)
   wandb_flush_interval_s: 300.0   # also push if this long since the last push (slow-iteration runs)
   wandb_transmit_interval_s: 60.0 # filestream transmit interval
   wandb_log_artifacts: true       # per-run model artifact upload (benchmark.py loads checkpoints from it)
