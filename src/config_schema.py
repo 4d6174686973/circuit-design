@@ -96,6 +96,22 @@ class LoggingConfig:
     wandb_mode: str = "online"             # online, offline, disabled
     log_level: str = "INFO"                # INFO (verbose, default) or WARNING (quiet -- real/production runs)
 
+    # --- wandb request-rate control (see src/wandb_logging.py) ---
+    wandb_flush_every: int = 100           # buffered iteration rows per push (1 = push every iteration)
+    wandb_flush_interval_s: float = 300.0  # also push if this long since the last push (slow runs)
+    wandb_transmit_interval_s: float = 60.0  # wandb-core filestream transmit interval
+    wandb_heartbeat_s: int = 30            # run keepalive interval; raising it cuts the request floor
+    wandb_log_artifacts: bool = True       # per-run model artifact upload (needed by benchmark.py)
+
+    # --- wandb robustness ---
+    wandb_init_stagger_s: float = 0.2      # init jitter window = this x sweep.max_parallel_runs
+    wandb_init_retries: int = 5            # extra wandb.init() attempts before training without wandb
+    wandb_retry_max: int = 5               # retries per wandb call (also wandb-core's own retry cap)
+    wandb_retry_wait_max_s: float = 60.0   # backoff cap for those retries
+    wandb_max_failures: int = 5            # consecutive failed pushes before dropping wandb for a run
+    wandb_init_timeout_s: float = 300.0    # wandb.init() timeout (default 90s is tight at high fan-out)
+    wandb_service_wait_s: float = 120.0    # wait for the local wandb-core service (default 30s)
+
 
 @dataclass
 class Config:
@@ -114,7 +130,7 @@ cs.store(name="config_schema", node=Config)
 
 
 def from_run_config(config: dict) -> DictConfig:
-    """Wrap a wandb run's logged config dict (from src.setup._init_wandb, itself
+    """Wrap a wandb run's logged config dict (from src.wandb_logging.init_run, itself
     OmegaConf.to_container(cfg, resolve=True)) back into this schema, so callers get the same dot
     access (cfg.data.dataset) and validation as a live Hydra run, instead of dict indexing.
 

@@ -33,7 +33,8 @@ from hydra.types import RunMode
 from omegaconf import DictConfig, OmegaConf
 
 import src.config_schema  # noqa: F401 -- registers Config with Hydra's ConfigStore
-from src.setup import (train_worker, get_or_create_wandb_sweep, plan_resources, apply_thread_env)
+from src.setup import (train_worker, get_or_create_wandb_sweep, plan_resources, apply_thread_env,
+                       finish_owned_sweep)
 
 # Global cross-combo process pool + submitted futures (see module docstring).
 _POOL = None
@@ -65,6 +66,7 @@ def _drain_pool() -> None:
             failures.append(label)
             logger.error(f"run failed [{label}]: {exc!r}")
     _POOL.shutdown(wait=True)
+    finish_owned_sweep()
     if failures:
         logger.error(f"{len(failures)}/{len(_FUTURES)} runs failed: {', '.join(failures)}")
         sys.stdout.flush(); sys.stderr.flush()
@@ -125,6 +127,9 @@ def main(cfg: DictConfig) -> None:
     # worker (and Aer) reads a concrete threads_per_run.
     max_parallel_runs, threads_per_run = plan_resources(cfg)
     cfg.sweep.threads_per_run = threads_per_run
+    # Written back too (not just used for the pool size) so each worker knows how many runs it is
+    # competing with: src/wandb_logging.init_run scales its init stagger window by it.
+    cfg.sweep.max_parallel_runs = max_parallel_runs
     apply_thread_env(threads_per_run)
 
     # Train the shared MPS once before fanning out so parallel workers never race on it.
@@ -136,6 +141,7 @@ def main(cfg: DictConfig) -> None:
     # surface directly, simpler to debug/attach).
     if not is_multirun and cfg.sweep.runs_batch_size == 1:
         train_worker(cfg_container, seeds[0], 0, combo, output_dir)
+        finish_owned_sweep()  # no pool here, so no _drain_pool to close the sweep out
         return
 
     # Submit this combo's seed-runs to the shared pool WITHOUT blocking, so Hydra proceeds to the

@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# QCBM sweep across one or more nodes (SLURM array job). CPU-only (GPU is future work, see bottom).
+# QCBM sweep across one or more nodes (SLURM array job). CPU-only (GPU: see bottom).
 #
 # The Hydra grid (--multirun key=v1,v2,...) is what's swept, not wandb (no wandb agent). Each array
-# task (= 1 node) runs its ENTIRE local grid concurrently in one process pool sized to the node's
-# CPUs (sweep.max_parallel_runs x sweep.threads_per_run, 0/0 = auto -- see src/setup.py::plan_resources),
-# instead of one combo at a time. Across array tasks, work is split by disjoint seed ranges (computed
-# in src/__main__.py from SLURM_ARRAY_TASK_ID), so every node runs the same grid without duplicating work.
+# task (= 1 node) runs its whole local grid concurrently in one pool sized to the node's CPUs
+# (sweep.max_parallel_runs x sweep.threads_per_run, 0/0 = auto -- see setup.py::plan_resources).
+# Across tasks, work is split by disjoint seed ranges (src/__main__.py, from SLURM_ARRAY_TASK_ID).
 #
-# All trailing arguments are passed straight through as Hydra overrides -- same as calling
-# `python -m src --multirun <these args>` directly, no quoting needed. ANY config key -- swept
-# (comma-separated) or fixed -- goes there; src/conf/config.yaml supplies the value for anything you
-# don't mention. There's no separate per-key env-var mechanism here to keep in sync with
-# config.yaml's fields.
+# All trailing arguments are passed through as Hydra overrides; any config key, swept
+# (comma-separated) or fixed, goes there. src/conf/config.yaml supplies everything else.
 #
 # Usage:
 #   sbatch [--array=0-N] [--nodelist=node1,node2,...] scripts/sweep.sh <hydra overrides...>
@@ -21,24 +17,22 @@
 # Examples:
 #   sbatch scripts/sweep.sh circuit.extension=none,metric_based,all_to_all                  # 1 node
 #   sbatch --array=0-3 scripts/sweep.sh circuit.extension=none,metric_based,all_to_all      # 4 nodes
-#   sbatch --array=0-1 --nodelist=pgi14-gpu7,pgi14-gpu8 scripts/sweep.sh circuit.extension=none  # 2 named nodes
+#   sbatch --array=0-1 --nodelist=pgi14-gpu7,pgi14-gpu8 scripts/sweep.sh circuit.extension=none
 #   scripts/sweep.sh circuit.extension=none,metric_based sweep.runs_batch_size=5 dataset=BAS
-#   scripts/sweep.sh circuit.extension=none,metric_based sweep.threads_per_run=4   # force 4 threads/run
+#   scripts/sweep.sh circuit.extension=none,metric_based sweep.threads_per_run=4
 #
-# NOTE: --output/--error directories must exist before `sbatch` (mkdir -p outputs/slurm_logs) --
-# SLURM creates the log file but not its parent directory. Edit the partition (-p), --gres,
-# --cpus-per-task and --time below for your cluster.
+# NOTE: mkdir -p outputs/slurm_logs before `sbatch` -- SLURM creates the log file, not its parent.
+# Edit the partition (-p), --gres, --cpus-per-task and --time below for your cluster.
 # ==============================================================================
 #SBATCH -p pgi14                                # EDIT: your SLURM partition
 #SBATCH --job-name=qcbm
 #SBATCH --error=outputs/slurm_logs/%A_%a.err    # %A = array job id, %a = array task id
 #SBATCH --output=outputs/slurm_logs/%A_%a.out
-#SBATCH --array=0                                # 0 = 1 node; 0-3 = 4 nodes (or pass --array on the CLI)
-#SBATCH --nodes=1                                # keep at 1 -- each array task gets 1 node
-#SBATCH --exclusive                               # whole node, all its CPUs (and GPUs, though unused here)
-#SBATCH --mem=0                                   # all available RAM on the node
-#SBATCH --cpus-per-task=4                         # EDIT: mostly cosmetic under --exclusive
-                                                   # GPU request even with --exclusive, even if unused
+#SBATCH --array=0                                # 0 = 1 node; 0-3 = 4 nodes (or --array on the CLI)
+#SBATCH --nodes=1                                # keep at 1 -- one node per array task
+#SBATCH --exclusive                              # whole node, all its CPUs
+#SBATCH --mem=0                                  # all available RAM
+#SBATCH --cpus-per-task=4                        # EDIT: mostly cosmetic under --exclusive
 #SBATCH --time=72:00:00
 
 set -euo pipefail
@@ -49,52 +43,55 @@ if [ "$#" -lt 1 ]; then
 fi
 OVERRIDES=("$@")
 
-# Run from the repo root regardless of where this was submitted/invoked from. Under sbatch, the
-# script runs from a spooled copy on the compute node, so BASH_SOURCE doesn't point at the repo --
-# use SLURM_SUBMIT_DIR (always set by sbatch, = the directory `sbatch` was run from) instead, and
-# fall back to BASH_SOURCE only for local (non-sbatch) runs.
+# Run from the repo root. Under sbatch the script runs from a spooled copy on the compute node, so
+# BASH_SOURCE doesn't point at the repo -- use SLURM_SUBMIT_DIR, falling back to BASH_SOURCE locally.
 cd "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}"
 
-# uv is often installed outside the default SLURM job PATH -- fail fast with a clear error instead
-# of a cryptic "command not found" buried in a log, rather than silently doing nothing.
+# uv is often outside the default SLURM job PATH -- fail fast instead of "command not found".
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 if ! command -v uv &> /dev/null; then
     echo "Error: 'uv' not found on PATH (checked \$HOME/.local/bin, \$HOME/.cargo/bin)." >&2
     exit 1
 fi
 
-# Sync once, explicitly, before any parallel work starts. uv uses file locks, so concurrent syncs
-# across nodes sharing a filesystem are safe -- but doing it once up front avoids many nodes/workers
-# independently racing to check the lockfile, and fails fast/loud on a real dependency problem.
+# Sync once up front (uv's file locks make concurrent syncs safe, but this fails loud and early).
 echo ">>> [Setup] Syncing environment..."
 uv sync
 
-# SLURM array vars are unset when this script is run directly (no sbatch) -- default to a single,
-# local "task 0 of 1" so everything below works the same for local testing and for a real array job.
-# (Pure SLURM job bookkeeping, not a config.yaml value, so a hardcoded fallback here is fine.)
+# SLURM array vars are unset for a direct (non-sbatch) run -- default to "task 0 of 1".
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-1}"
 ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-local$$}"
 
-# --- Cross-node work split: disjoint seed ranges, not manual override-splitting ---
-# Every node runs the IDENTICAL Hydra grid (${OVERRIDES}); src/__main__.py reads SLURM_ARRAY_TASK_ID
-# itself and shifts each node's seed block to stay disjoint, so a 4-node array gives 4x the seed
-# coverage with zero duplicated work -- nothing to compute here.
+# Cross-node work split needs nothing here: every node runs the identical grid and src/__main__.py
+# shifts each node's seed block by SLURM_ARRAY_TASK_ID to keep them disjoint.
 
-# --- Leader/worker sweep synchronization (only needed for real multi-node runs) ---
-# A single-node run just lets Python create its own sweep id inline, same as always -- no
-# coordination needed. For multi-node, task 0 creates the sweep (real if wandb_mode=online, a local
-# synthetic id otherwise -- get_or_create_wandb_sweep handles both) and publishes it to a file on the
-# shared filesystem (SLURM nodes on a cluster normally share one); other tasks poll for that file
-# instead of independently creating (and colliding with) their own.
+# Multi-node sweep sync: task 0 creates the sweep and publishes its id to the shared filesystem;
+# other tasks poll for it instead of creating (and colliding with) their own. Single-node runs just
+# let Python create the id inline.
 SHARED_SWEEP_FILE=".sweep_${ARRAY_JOB_ID}.tmp"
 
 cleanup() {
     if [ "$TASK_ID" == "0" ]; then
         rm -f "$SHARED_SWEEP_FILE"
     fi
+    if [ -n "${WANDB_SERVICE:-}" ]; then
+        uv run --no-sync wandb beta core stop > /dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT INT TERM
+
+# Optional: one shared wandb-core backend for the node instead of one process per concurrent run
+# (at max_parallel_runs ~= core count that adds up). Opt-in -- beta, and a single point of failure
+# for LOGGING only, since src/wandb_logging.py keeps training alive without it.
+#   QCBM_SHARED_WANDB_CORE=1 sbatch scripts/sweep.sh <overrides...>
+if [ "${QCBM_SHARED_WANDB_CORE:-0}" = "1" ]; then
+    echo ">>> [W&B] Starting one shared wandb-core service for this node..."
+    # --idle-timeout 0 disables idle shutdown; the token goes to stdout, notes to stderr.
+    WANDB_SERVICE="$(uv run --no-sync wandb beta core start --idle-timeout 0 | tail -n 1)"
+    export WANDB_SERVICE
+    echo ">>> [W&B] WANDB_SERVICE=${WANDB_SERVICE}"
+fi
 
 if [ "$TASK_COUNT" -gt 1 ]; then
     if [ "$TASK_ID" == "0" ]; then
@@ -118,43 +115,20 @@ uv run --no-sync python -m src --multirun "${OVERRIDES[@]}"
 
 echo ">>> [Run] Task ${TASK_ID} finished successfully."
 
-# --- Upload offline wandb runs (no-op in online mode) ---------------------------------------------
-# With logging.wandb_mode=offline each run is written to ./wandb/offline-run-* on the shared
-# filesystem instead of streamed live -- the recommended mode for large sweeps, since streaming
-# hundreds of concurrent runs trips wandb's per-project filestream rate limit (HTTP 429), which
-# stalls logging, backs up memory, and can take runs (and the whole process pool) down. Now that
-# training is done we upload them in one pass. Notes:
-#   * `wandb sync` marks each run dir synced, so already-synced runs (and re-invocations) are
-#     skipped -- and it's a harmless no-op when there are no offline runs (i.e. online mode).
-#   * Guarded with `|| ...`: training already succeeded, so a transient upload error must NOT fail
-#     the job (set -e) -- offline runs persist on disk and can always be synced again by hand.
-#   * Multi-node arrays share one ./wandb dir; each task syncs what's present. The per-run synced
-#     marker keeps concurrent tasks from re-uploading each other's already-synced runs.
-if compgen -G "wandb/offline-run-*" > /dev/null 2>&1; then
-    echo ">>> [Sync] Uploading offline wandb runs to the server..."
-    uv run --no-sync wandb sync --sync-all \
-        || echo ">>> [Sync] WARNING: 'wandb sync' failed; sync later with: uv run wandb sync --sync-all"
-    echo ">>> [Sync] Done."
-fi
-
 # ==============================================================================
 # GPU support -- FUTURE WORK (this launcher is CPU-only)
 # ==============================================================================
-# The current implementation is tuned for CPU: each run is many small numpy/scipy ops (kernel,
-# gradient, Adam) plus one heavier Aer statevector sampling step, and throughput comes from running
-# MANY runs in parallel with a few threads each. A GPU is only worthwhile at higher qubit counts,
-# and a naive "sampling on GPU, everything else on CPU" hybrid is dominated by per-iteration
-# CPU<->GPU transfers. Making GPUs pay off is a non-trivial change; when tackling it, touch:
+# CPU throughput comes from many parallel runs with a few threads each: per iteration it's mostly
+# small numpy ops (kernel, gradient, Adam) plus one heavier Aer sampling step. A GPU only pays off at
+# higher qubit counts, and "sampling on GPU, rest on CPU" is dominated by per-iteration transfers.
+# When tackling it, touch:
 #
-#   * src/setup.py::plan_resources    -- branch on cfg.sweep.gpus_per_node: size the pool to GPUs
-#                                        (~1 run/GPU, bounded by VRAM) instead of CPU cores.
-#   * src/setup.py::train_worker      -- CUDA_VISIBLE_DEVICES pinning is already stubbed; skip the
-#                                        CPU thread-capping for GPU runs.
-#   * src/setup.py::setup_qiskit_simulator -- device="GPU" path exists (batched_shots_gpu, blocking);
-#                                        verify blocking_qubits/VRAM sizing for the target GPUs.
-#   * src/cost.py, src/qcbm.py        -- to avoid transfer overhead, move the per-iteration kernel/
-#                                        gradient math onto the GPU (e.g. cupy) so a run stays
-#                                        device-resident across the whole iteration, not just sampling.
-#   * this script                     -- add #SBATCH --gres=gpu:N; pass sweep.gpus_per_node=N and
-#                                        ibm.simulator=aer_statevec_gpu in the override string.
-# The "GPU NOTE" comments in the Python sources mark each of these swap points inline.
+#   * setup.py::plan_resources    -- branch on cfg.sweep.gpus_per_node: size the pool to GPUs
+#                                    (~1 run/GPU, bounded by VRAM) instead of CPU cores.
+#   * setup.py::train_worker      -- CUDA_VISIBLE_DEVICES pinning is stubbed; skip the thread cap.
+#   * setup.py::setup_qiskit_simulator -- device="GPU" path exists; verify blocking_qubits/VRAM.
+#   * src/cost.py, src/qcbm.py    -- move the per-iteration kernel/gradient math onto the GPU (cupy)
+#                                    so a run stays device-resident, not just during sampling.
+#   * this script                 -- add #SBATCH --gres=gpu:N; pass sweep.gpus_per_node=N and
+#                                    ibm.simulator=aer_statevec_gpu as overrides.
+# The "GPU NOTE" comments in the Python sources mark each swap point inline.

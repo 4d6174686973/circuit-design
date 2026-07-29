@@ -1,4 +1,3 @@
-# other imports
 import numpy as np
 import logging
 import json
@@ -7,11 +6,9 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import time
 
-# qiskit imports
 from qiskit.circuit import QuantumCircuit
-from qiskit import qpy  # for saving the circuit as file
+from qiskit import qpy
 
-# own imports
 from src.utils import array_to_str, sample_info
 from src.cost import adam, cost_mmd_pre, cost_grad_mmd_pre, cost_grad_kl_div
 from src.data import DataLoader
@@ -24,13 +21,12 @@ class QCBM:
             backend,
             circuit: QuantumCircuit = None,
             parameters: np.ndarray = None,
-            adam_learning_rate: float = 0.01,  # initial learning rate for Adam optimizer
-            finite_diff_epsilon: float = 1.0e-8,  # finite difference epsilon for KL gradient
-            gradient_workers: int = 8,  # threads for the per-parameter gradient loop
-            use_parameter_binds: bool = True,  # True: direct AerSimulator.run fast path; False: SamplerV2 primitive (hardware)
+            adam_learning_rate: float = 0.01,
+            finite_diff_epsilon: float = 1.0e-8,  # for KL gradient
+            gradient_workers: int = 8,  # per-parameter gradient loop
+            use_parameter_binds: bool = True,  # False: SamplerV2 primitive (hardware) instead of Aer fast path
             ) -> None:
 
-        # member variables
         self.sampler = sampler
         self.backend = backend
         self.circuit: QuantumCircuit = circuit
@@ -41,17 +37,12 @@ class QCBM:
         self.gradient_workers: int = gradient_workers
         self.use_parameter_binds: bool = use_parameter_binds
 
-        # for training state and results
-        self.weight_grad: np.ndarray = np.zeros(self.circuit.num_parameters)  # current weight gradients
-        self.parameter_hist: list[np.ndarray] = [self.parameters]  # store all parameters
-        self.losses: dict[str, list] = {
-            "mmd_train": [],
-            "mmd_val": [],
-        }  # store all losses during training; held-out test tracking is test_bench_hist below
-        # full held-out test benchmark suite (bench_dist mmd/kl/tv/fidelity + bench_val generalization
-        # metrics for every dataset + BAS-only bench_BAS precision/recall/qbas) per eval step;
-        # variable-key rows (bench_BAS only for BAS) accumulated as dicts and dumped to
-        # test_metrics.parquet in save(). wandb receives the same dict inline each eval step.
+        # training state and results
+        self.weight_grad: np.ndarray = np.zeros(self.circuit.num_parameters)
+        self.parameter_hist: list[np.ndarray] = [self.parameters]
+        self.losses: dict[str, list] = {"mmd_train": [], "mmd_val": []}  # test tracking is test_bench_hist below
+        # per-eval-step held-out test benchmark suite (bench_dist + bench_val + BAS-only bench_BAS),
+        # variable-key dicts dumped to test_metrics.parquet in save(); also logged to wandb inline.
         self.test_bench_hist: list[dict] = []
 
         # best checkpoint (model selection); populated during training
@@ -59,17 +50,15 @@ class QCBM:
         self.best_iter: int = -1
         self.best_metric: float = np.inf
         self.model_selection_metric: str = "mmd_val"
-        self.total_measurements: int = 0  # cumulative circuit measurements over training
+        self.total_measurements: int = 0
+        self._last_wandb_s: float = 0.0  # cost of the previous _log_step call (see _log_step)
 
     def _run_binds(self, stack: np.ndarray, N_shots: int, circuit=None, seed_simulator=None) -> list:
         """Run a (n, P) stack of parameter sets and return a list of n count dicts.
 
-        Uses Aer's native parameter_binds fast path when available (simulation), else falls back to
-        a single 2D-parameter PUB through the SamplerV2 primitive (hardware). `circuit` defaults to
-        self.circuit; pass a different one to sample e.g. the linear baseline circuit.
-        `seed_simulator` overrides the backend's configured RNG seed for THIS run only (used to pin
-        the step-0 baseline to a fixed seed so it is identical across connectivities); Aer fast path
-        only -- ignored on the hardware primitive path.
+        Uses Aer's parameter_binds fast path when available, else a single 2D-parameter PUB through
+        SamplerV2 (hardware). `circuit` defaults to self.circuit. `seed_simulator` overrides the RNG
+        seed for this run only (pins the step-0 baseline across connectivities); Aer path only.
         """
         circuit = circuit if circuit is not None else self.circuit
         if self.use_parameter_binds:
@@ -88,9 +77,9 @@ class QCBM:
         return [flat[i].get_counts() for i in range(n)] if meas.shape else [meas.get_counts()]
 
     def sample(self, N_shots: int, circuit=None, params: np.ndarray = None, seed_simulator=None) -> dict:
-        '''Generates samples from a circuit at given parameters. Defaults to self.circuit at
-        self.parameters; pass both to sample an arbitrary circuit instead (e.g. the linear baseline).
-        seed_simulator pins the RNG seed for this run (see _run_binds).'''
+        '''Samples from a circuit at given parameters. Defaults to self.circuit at self.parameters;
+        pass both to sample an arbitrary circuit (e.g. the linear baseline). seed_simulator pins the
+        RNG seed for this run (see _run_binds).'''
         circuit = circuit if circuit is not None else self.circuit
         params = params if params is not None else self.parameters
         stack = np.asarray(params).reshape(1, circuit.num_parameters)
@@ -99,8 +88,8 @@ class QCBM:
     def param_shift_sampling(self, parameter_values: np.ndarray, shift: float, N_shots: int = 10000) -> tuple:
         """ Parameter-shift sampling for gradient computation.
 
-        Builds a single (2P+1, P) stack of parameter sets (plus-shifted, minus-shifted, centre) and
-        runs them in one Aer native `parameter_binds` call instead of 2P+1 separate submissions.
+        Builds a single (2P+1, P) stack (plus-shifted, minus-shifted, centre) and runs it in one
+        Aer `parameter_binds` call instead of 2P+1 separate submissions.
 
         Returns:
             dist_plus:  list of P count dicts for the +shift circuits
@@ -125,8 +114,8 @@ class QCBM:
     def _mmd_gradient(self, T, T_probs, S, S_probs, dists_plus, dists_minus, sigmas):
         """Compute the full MMD gradient vector, parallelized across parameters.
 
-        The target (T) and current-sample (S) arrays/probabilities are extracted once and reused
-        for every parameter; only the plus/minus distributions differ per parameter.
+        T and S arrays/probabilities are extracted once and reused for every parameter; only the
+        plus/minus distributions differ per parameter.
         """
         def grad_i(i):
             Pn, P_probs = sample_info(dists_plus[i])
@@ -140,23 +129,20 @@ class QCBM:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             return np.array(list(executor.map(grad_i, range(n))))
 
-    @staticmethod
-    def _wandb_log_timed(wandb_run, payload: dict, step: int, start_time: float) -> tuple:
-        """Log payload, then log this step's wandb-logging + total wall-clock overhead as a second
-        entry at the SAME step (commit=False then commit=True merges both into one wandb row,
-        instead of the overhead lagging a step behind -- verified empirically against wandb's
-        history records). total_s is measured from start_time (the beginning of sampling) through
-        the end of the main log() call, so it covers sampling + gradient + eval + logging -- the
-        full wall-clock cost of the step. Returns (logging_s, total_s) so the caller can also print
-        them.
+    def _log_step(self, wandb_run, payload: dict, step: int) -> float:
+        """Hand one step's metrics to the (buffering) wandb logger; returns the seconds it took.
+
+        wandb_run is a src.wandb_logging.WandbLogger: rows are buffered locally and pushed in chunks,
+        so this normally costs ~0 and only occasionally pays for a push. That cost cannot be reported
+        in the row it is measured on (a call can't time itself), so it is carried in
+        self._last_wandb_s and logged as time/wandb_s on the FOLLOWING step -- see the time/* keys in
+        stochastic_gradient_descent.
         """
-        log_start = time.time()
-        wandb_run.log(payload, step=step, commit=False)
-        log_end = time.time()
-        logging_s = log_end - log_start
-        total_s = log_end - start_time
-        wandb_run.log({"time/logging_s": logging_s, "time/total_s": total_s}, step=step, commit=True)
-        return logging_s, total_s
+        if wandb_run is None:
+            return 0.0
+        payload["time/wandb_s"] = self._last_wandb_s
+        self._last_wandb_s = wandb_run.log(payload, step=step) or 0.0
+        return self._last_wandb_s
 
     def _log_baseline_step(self, baseline_circuit, baseline_params, baseline_seed, N_shots: int,
                            T_train, T_train_probs, T_val, T_val_probs, sigmas: np.ndarray,
@@ -164,13 +150,11 @@ class QCBM:
                            X_test_count: dict, wandb_run, logger) -> None:
         """Sample the shared LINEAR, UNEXTENDED circuit and log it as step 0 (see the
         baseline_circuit/baseline_params docstring on stochastic_gradient_descent). Mutates
-        self.losses/self.test_bench_hist exactly like a training-iteration eval step, but is not a
-        selectable checkpoint. Always runs -- the baseline is mandatory (step 0 is always the linear
-        reference); training iterations are then logged at steps 1..iterations.
+        self.losses/self.test_bench_hist like a training-iteration eval step, but is not a
+        selectable checkpoint.
 
-        The baseline is sampled with a FIXED seed (baseline_seed, the sweep's global
-        initial_random_seed) rather than the per-run seed, so -- since every connectivity shares the
-        same linear circuit -- step 0 is bit-identical across all of them (no per-run shot noise)."""
+        Sampled with a FIXED seed (baseline_seed, the sweep's global initial_random_seed) rather
+        than the per-run seed, so step 0 is bit-identical across all connectivities."""
         from src.benchmark import evaluate  # local import avoids any import-time cycle with setup
 
         start_time = time.time()
@@ -196,9 +180,10 @@ class QCBM:
                     "train/mmd_train": b_train, "train/mmd_val": b_val,
                     "train/mmd_test": b_bench.get("bench_dist/test/mmd", np.nan),
                     "time/sampling_s": sample_time - start_time, "time/gradient_s": 0.0,
-                    "time/eval_s": eval_time - sample_time}
+                    "time/eval_s": eval_time - sample_time,
+                    "time/total_s": eval_time - start_time}
             log0.update(b_bench)
-            self._wandb_log_timed(wandb_run, log0, step=0, start_time=start_time)
+            self._log_step(wandb_run, log0, step=0)
 
     def stochastic_gradient_descent(
             self, X_train: np.ndarray, X_train_count: dict, X_val_count: dict, X_test_count: dict,
@@ -209,35 +194,34 @@ class QCBM:
             *, baseline_circuit, baseline_params: np.ndarray, baseline_seed: int):
         """ Stochastic Gradient Descent with parameter-shift / finite-difference sampling.
 
-        The train/validation/test splits are supplied by the caller (computed once upstream) so the
-        split is not recomputed here. Validation MMD drives model selection.
+        Splits are supplied pre-computed by the caller; validation MMD drives model selection.
 
-        On every eval step the full benchmark suite (src.benchmark.evaluate: bench_dist/test/mmd,
-        bench_dist/test/kl, bench_dist/test/tv, bench_dist/test/fidelity, the Gili et al. bench_val/*
-        generalization metrics for every dataset kind, and -- BAS only -- bench_BAS/{precision,
-        recall,qbas}) is computed on the TEST split from the current-parameter samples and logged to
-        wandb, so the held-out test trajectory -- not just its final-checkpoint value -- is tracked.
-        `train/mmd_test` mirrors bench_dist/test/mmd (identical MMD kernel/sigmas) under the "train"
-        tab alongside train/mmd_train and train/mmd_val, for a single at-a-glance training curve.
-        valid_patterns scopes the BAS-only bench_BAS extras; it is None for JGB, where bench_val/*
-        instead treats every bitstring as valid (see benchmark.generalization_metrics). This logging
-        is skipped (no bench_dist/bench_val/bench_BAS keys, no test_bench_hist rows) whenever the
-        test split is empty (e.g. val_size + train_size == 1).
+        On every eval step the full benchmark suite (src.benchmark.evaluate: bench_dist/test/{mmd,
+        kl,tv,fidelity}, Gili et al. bench_val/* generalization metrics, and -- BAS only --
+        bench_BAS/{precision,recall,qbas}, scoped by valid_patterns; None for JGB, where bench_val/*
+        treats every bitstring as valid) is computed on the TEST split and logged to wandb, tracking
+        the held-out test trajectory rather than just its final value. `train/mmd_test` mirrors
+        bench_dist/test/mmd under the "train" tab alongside train/mmd_{train,val} for one
+        at-a-glance curve. All of this is skipped when the test split is empty (e.g.
+        val_size + train_size == 1).
 
         baseline_circuit/baseline_params/baseline_seed (REQUIRED, keyword-only): the shared LINEAR,
-        UNEXTENDED circuit, its parameters, and the FIXED sampling seed (the sweep's global
-        initial_random_seed). Its sampling output is evaluated with the same metric suite and logged
-        at wandb step 0 (cumulative_measurements=0) -- a common pre-training reference point for
-        every connectivity. Because the circuit is shared and the seed is fixed (not the per-run
-        seed), step 0 is bit-identical across all connectivities. Step 0 is ALWAYS this baseline;
-        the first training iteration is step 1. The baseline is a reference only: it is NOT a
-        checkpoint of this (extended) circuit and never participates in model selection.
+        UNEXTENDED circuit/params/seed (the sweep's fixed initial_random_seed), evaluated with the
+        same metric suite and logged at wandb step 0 as a common pre-training reference across
+        connectivities -- bit-identical every run since circuit and seed are fixed. Step 0 is
+        always this baseline (training starts at step 1); it's a reference only, never a checkpoint
+        of this circuit, and never participates in model selection.
+
+        wandb_run is a src.wandb_logging.WandbLogger (or None for no wandb logging). Every iteration
+        is logged at its own step, but rows are buffered and pushed in chunks of
+        logging.wandb_flush_every so request volume stays flat with hundreds of concurrent runs; the
+        logger never raises, so a rate-limited or broken wandb only costs logging, not the run.
         """
 
         logger = logging.getLogger('QCBM')
         self.model_selection_metric = model_selection_metric
         sigmas = np.array(sigmas)
-        from src.benchmark import evaluate  # local import avoids any import-time cycle with setup
+        from src.benchmark import evaluate  # avoids import-time cycle with setup
 
         # Parameters
         if loss_func == 'KL':
@@ -248,23 +232,20 @@ class QCBM:
             raise ValueError("Loss Function not implemented")
 
         # Variables
-        self.weight_grad = np.zeros(self.circuit.num_parameters)  # current weight gradients
+        self.weight_grad = np.zeros(self.circuit.num_parameters)
         [m, v] = [np.zeros(self.circuit.num_parameters) for _ in range(2)]  # adam variables
 
-        # pre-extract the held-out targets once (unchanged across iterations); the test split is
-        # evaluated via the benchmark.evaluate() suite below instead (bench_dist/test/mmd there uses
-        # the same kernel/sigmas), so it needs no separate sample_info extraction here.
+        # pre-extract held-out targets once; the test split is evaluated via benchmark.evaluate()
+        # below instead (bench_dist/test/mmd uses the same kernel/sigmas).
         T_train, T_train_probs = sample_info(X_train_count)
         T_val, T_val_probs = sample_info(X_val_count) if len(X_val_count) else (None, None)
 
         measurements_per_step = (2 * self.circuit.num_parameters + 1) * N_shots
 
-        # Resolve the MMD-target minibatch size ONCE from mmd_batch_fraction (|X_train| is fixed).
-        # 0 => full train set. (0,1] => that fraction, rounded and clamped to [1, |X_train|]. Note
-        # this only subsamples the TARGET data in the (classical) kernel terms; the dominant cost --
-        # the (2P+1)*N_shots quantum parameter-shift sampling below -- is independent of it, so a
-        # smaller batch buys ~no speedup and only adds gradient noise. For a fraction that rounds to
-        # >= |X_train| (typical on the tiny finite BAS support) batch_n == |X_train|, i.e. full set.
+        # Resolve the MMD-target minibatch size once. 0 => full train set. (0,1] => that fraction,
+        # rounded and clamped to [1, |X_train|]. Only subsamples the (classical) kernel target data --
+        # the dominant cost is the (2P+1)*N_shots quantum sampling below, independent of batch size,
+        # so a smaller batch buys ~no speedup and only adds gradient noise.
         n_train = len(X_train)
         if mmd_batch_fraction and mmd_batch_fraction > 0:
             batch_n = int(min(n_train, max(1, round(mmd_batch_fraction * n_train))))
@@ -275,10 +256,8 @@ class QCBM:
         logger.info(f"MMD target batch: {'full train set' if batch_n == 0 else f'{batch_n}/{n_train}'} "
                     f"samples (mmd_batch_fraction={mmd_batch_fraction})")
 
-        # Step 0 is ALWAYS the shared LINEAR, UNEXTENDED circuit (common to every connectivity), so
-        # all runs share a pre-training reference point. Training iterations are then logged at
-        # steps 1..iterations. Not a selectable checkpoint (different circuit than self.circuit), so
-        # it is excluded from model selection.
+        # Step 0 is always the shared LINEAR, UNEXTENDED circuit; training iterations are logged at
+        # steps 1..iterations. Not a selectable checkpoint, so excluded from model selection.
         self._log_baseline_step(
             baseline_circuit, baseline_params, baseline_seed, N_shots, T_train, T_train_probs,
             T_val, T_val_probs, sigmas, dataset_kind, valid_patterns, X_train_count, X_test_count,
@@ -325,8 +304,7 @@ class QCBM:
             self.parameters = self.parameters + param_update
             self.parameter_hist.append(self.parameters.copy())
 
-            # Logged step: step 0 is the linear-baseline reference, so training iteration `it` is
-            # logged at step it + 1. step 1 == the first training iteration.
+            # step 0 is the linear-baseline reference, so iteration `it` logs at step it + 1
             step = it + 1
 
             # Evaluate held-out losses (every eval_every iterations and on the final iteration)
@@ -335,8 +313,6 @@ class QCBM:
             if do_eval:
                 mmd_train = cost_mmd_pre(T_train, T_train_probs, S, S_probs, sigmas)
                 mmd_val = cost_mmd_pre(T_val, T_val_probs, S, S_probs, sigmas) if T_val is not None else np.nan
-                # full held-out test-set benchmark suite on the current-parameter samples S_counts;
-                # bench_dist/test/mmd (same kernel/sigmas) replaces the old standalone mmd_test loss.
                 if len(X_test_count):
                     test_bench = evaluate(S_counts, {"test": X_test_count}, dataset_kind,
                                           sigmas=sigmas, valid_patterns=valid_patterns,
@@ -348,11 +324,9 @@ class QCBM:
             self.losses["mmd_val"].append(mmd_val)
             eval_time = time.time()
 
-            # Model selection: keep the checkpoint (pre-update params) with the best metric. Test-set
-            # metrics are deliberately NOT selectable here -- using the held-out test split to pick a
-            # checkpoint would leak it into model selection, defeating its purpose as a clean,
-            # touched-once evaluation set. best_iter is the logged step (it + 1), so it indexes the
-            # same step where this checkpoint's metrics appear.
+            # Keep the checkpoint (pre-update params) with the best metric. Test-set metrics are
+            # deliberately NOT selectable -- using the held-out test split would leak it into
+            # selection. best_iter indexes the same step where this checkpoint's metrics appear.
             if do_eval:
                 sel = {"mmd_train": mmd_train, "mmd_val": mmd_val}[model_selection_metric]
                 if np.isfinite(sel) and sel < self.best_metric:
@@ -360,10 +334,11 @@ class QCBM:
                     self.best_iter = step
                     self.best_params = params_snapshot
 
-            # wandb logging (train/cumulative_measurements every step for the MMD-vs-measurements
-            # x-axis). time/total_s covers the WHOLE step -- sampling + gradient + eval + the wandb
-            # logging call itself -- so _wandb_log_timed measures it around its own log() call and
-            # folds it back into the SAME wandb step (see that helper's docstring).
+            # Every iteration gets its own row (cumulative_measurements is the MMD-vs-measurements
+            # x-axis, so it must not be sparse); the rows are buffered and pushed in chunks by the
+            # logger, not sent one by one -- see src/wandb_logging.py. time/total_s is the whole step
+            # minus the wandb call, whose cost lands in the next step's time/wandb_s (see _log_step).
+            total_s = eval_time - start_time
             if wandb_run is not None:
                 log = {
                     "train/step": step,
@@ -373,41 +348,41 @@ class QCBM:
                     "time/sampling_s": sample_time - start_time,
                     "time/gradient_s": grad_time - sample_time,
                     "time/eval_s": eval_time - grad_time,
+                    "time/total_s": total_s,
                 }
                 if do_eval:
                     log.update({"train/mmd_train": mmd_train, "train/mmd_val": mmd_val,
                                "train/mmd_test": test_bench.get("bench_dist/test/mmd", np.nan)})
-                    # full test-set benchmark suite: bench_dist/test/{mmd,kl,tv,fidelity},
-                    # bench_val/* (all datasets), plus bench_BAS/{precision,recall,qbas} for BAS
                     log.update(test_bench)
-                logging_s, total_s = self._wandb_log_timed(wandb_run, log, step, start_time)
+                logging_s = self._log_step(wandb_run, log, step)
             else:
-                logging_s, total_s = 0.0, eval_time - start_time
+                logging_s = 0.0
 
             # Final logging
             logger.info(f"| Total = {np.round(total_s, 2)} s | Sampling = {np.round(sample_time - start_time, 2)} s | Gradient = {np.round(grad_time - sample_time, 2)} s | Eval = {np.round(eval_time - grad_time, 2)} s | Logging = {np.round(logging_s, 2)} s")
             test_mmd_str = f"{test_bench['bench_dist/test/mmd']:.6f}" if "bench_dist/test/mmd" in test_bench else "n/a"
             logger.info(f"| MMD loss | Train = {np.round(mmd_train, 6)} | Val = {np.round(mmd_val, 6)} | Test = {test_mmd_str}")
 
+        # Push whatever is still buffered before the caller moves on to saving/artifact upload, so a
+        # partially-filled last chunk isn't held until run.finish().
+        if wandb_run is not None:
+            wandb_run.flush(force=True)
+
         logger.info(f"Training finished | best {model_selection_metric} = {np.round(self.best_metric, 6)} @ iter {self.best_iter}")
 
     def save(self, save_dir: str):
         '''Save the model, including both the best (validation-selected) and final checkpoints.'''
 
-        # save losses as file
         losses_df = pd.DataFrame(self.losses)
         losses_df.to_parquet(f"{save_dir}/losses.parquet")
 
-        # save the per-eval-step test benchmark suite (variable columns; bench_BAS/* only for BAS)
         if self.test_bench_hist:
             pd.DataFrame(self.test_bench_hist).to_parquet(f"{save_dir}/test_metrics.parquet")
 
-        # save full parameter history
         np.save(f"{save_dir}/params.npy", np.array(self.parameter_hist, dtype=object), allow_pickle=True)
 
-        # save best checkpoint (lowest model_selection_metric) and final checkpoint (last training
-        # iteration, self.parameters) + metadata for model selection / benchmarking. The two can
-        # differ whenever training doesn't monotonically improve on the selection metric.
+        # best (lowest model_selection_metric) and final (last iteration) checkpoints can differ
+        # whenever training doesn't monotonically improve on the selection metric
         np.save(f"{save_dir}/best_params.npy", np.asarray(self.best_params, dtype=float))
         np.save(f"{save_dir}/final_params.npy", np.asarray(self.parameters, dtype=float))
         with open(f"{save_dir}/checkpoint_meta.json", "w") as f:
@@ -420,7 +395,6 @@ class QCBM:
                 "num_parameters": int(self.circuit.num_parameters),
             }, f, indent=2)
 
-        # save circuit as file
         with open(f"{save_dir}/circuit.qpy", 'wb') as file:
             qpy.dump(self.circuit, file)
 

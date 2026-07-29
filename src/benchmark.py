@@ -6,6 +6,7 @@ reuse helpers from src.utils / src.cost so the held-out MMD matches the training
 """
 
 import os
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -350,6 +351,11 @@ def load_checkpoint(run, root: str = "./artifacts", which: str = "best"):
     manifest -- if both expected files are already present locally under root/run.id. Safe here
     because each run logs exactly one model artifact, written once at the end of training (see
     src/setup.py::setup_and_train_qcbm), so there is no newer version a stale local copy could miss.
+
+    If a run has no model artifact -- artifact upload disabled (logging.wandb_log_artifacts) or its
+    upload was refused, e.g. rate-limited -- this falls back to the training run's own output
+    directory, whose absolute path every run records in its summary as `save_dir`. That only works
+    when the benchmark runs on a machine that can see that path.
     """
     from qiskit import qpy
     if which not in ("best", "final"):
@@ -366,9 +372,19 @@ def load_checkpoint(run, root: str = "./artifacts", which: str = "best"):
             if a.type == "model":
                 art = a
                 break
-        if art is None:
-            raise FileNotFoundError(f"No model artifact for run {run.id}")
-        art.download(root=local_dir)
+        if art is not None:
+            art.download(root=local_dir)
+        else:
+            save_dir = run.summary.get("save_dir")
+            local = {"circuit.qpy": circuit_path, f"{which}_params.npy": params_path}
+            if not save_dir or not all(os.path.exists(f"{save_dir}/{f}") for f in local):
+                raise FileNotFoundError(
+                    f"No model artifact for run {run.id} and no readable save_dir "
+                    f"({save_dir!r}) to fall back on")
+            print(f"[benchmark]     [{run.id}] no model artifact, loading from {save_dir}")
+            os.makedirs(local_dir, exist_ok=True)
+            for name, dest in local.items():
+                shutil.copyfile(f"{save_dir}/{name}", dest)
 
     with open(circuit_path, "rb") as f:
         circuit = qpy.load(f)[0]

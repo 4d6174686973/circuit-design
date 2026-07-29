@@ -20,12 +20,18 @@ from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 from hydra.utils import to_absolute_path
 
 # own modules
+from src import wandb_logging
 from src.qcbm import QCBM
 from src.mps import MPS
 from src.data import DataLoader, BAS, JGB
 from src.extension import compose_parameterized_circuit, linear_topology, all_to_all_topology, nearest_neighbor_topology, metric_based_topology, chow_liu_topology, extend_circuit, random_topology, select_threshold
 from src.utils import mutual_info_matrix, feature_distance_matrix
 from src.decompositon import mps2circuit
+
+
+# Set by get_or_create_wandb_sweep when THIS process creates the sweep; read by finish_owned_sweep to
+# close it out at exit. Empty in every other process (workers, and array tasks that inherited the id).
+_OWNED_SWEEP: dict = {}
 
 
 def setup_qiskit_simulator(cfg: DictConfig) -> tuple:
@@ -428,7 +434,13 @@ def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
     created id is also written to that path on a shared filesystem, so other nodes can poll for it
     and export it themselves instead of each independently creating (and colliding on) their own
     sweep. Only written on actual creation, never on the early-return reuse path above.
+
+    On creation the sweep is also moved out of PENDING into RUNNING, and this process is recorded as
+    the sweep's OWNER (see finish_owned_sweep) -- a sweep driven by Hydra has no wandb agent to
+    advance its state, so nothing else ever would.
     """
+    global _OWNED_SWEEP
+
     if os.environ.get("WANDB_SWEEP_ID"):
         return os.environ["WANDB_SWEEP_ID"]
 
@@ -447,50 +459,29 @@ def get_or_create_wandb_sweep(cfg: DictConfig) -> str:
         with open(sweep_id_file, "w") as f:
             f.write(sweep_id)
 
+    _OWNED_SWEEP = {"id": sweep_id, "entity": cfg.logging.wandb_entity,
+                    "project": cfg.logging.wandb_project, "mode": cfg.logging.wandb_mode}
+    wandb_logging.set_sweep_state(sweep_id, "RUNNING", entity=_OWNED_SWEEP["entity"],
+                                  project=_OWNED_SWEEP["project"], mode=_OWNED_SWEEP["mode"])
     return sweep_id
 
 
-def _init_wandb(cfg: DictConfig, sweep_id: str):
-    """Initialize a wandb run for one seed; returns the run (or None if disabled).
+def finish_owned_sweep() -> None:
+    """Mark the sweep FINISHED, if this process is the one that created it. Never raises.
 
-    Joining the sweep is done via an EXPLICIT `settings=wandb.Settings(sweep_id=...)` override,
-    not by relying on wandb.init() picking up the WANDB_SWEEP_ID env var on its own. That env-var
-    path is unreliable here: wandb.sweep() (in get_or_create_wandb_sweep) triggers a login call
-    that snapshots os.environ into a process-wide Settings singleton BEFORE we set WANDB_SWEEP_ID,
-    so every later wandb.init() in that process (e.g. every sequential Hydra job when
-    runs_batch_size==1, since BasicLauncher reuses one process) would silently reuse that
-    stale, sweep-less snapshot instead of re-reading the env var — this is exactly what produced
-    runs that were created but not attached to the sweep. Passing sweep_id explicitly here is a
-    per-call override applied on top of that singleton, so it's correct regardless of caching.
+    Called once the launcher has joined all of its runs (src/__main__.py). Without it the sweep stays
+    in whatever state it was last put in and the dashboard never shows it as done -- there is no
+    wandb agent here to close it out.
 
-    No wandb `group` is set: the swept parameters live in each run's `config`, so downstream
-    plotting/benchmarking filters/groups on config keys (e.g. circuit.extension) directly instead
-    of a redundant group string — which also sidesteps wandb's 128-char GroupName limit.
+    Only the CREATING process does this, so in a multi-node SLURM array the nodes that merely
+    inherited WANDB_SWEEP_ID (via the shared sweep-id file) never touch the state. The creating node
+    can still finish before the others; FINISHED means "start no new runs, let running ones finish",
+    so their runs keep reporting normally.
     """
-    import wandb
-    entity = cfg.logging.wandb_entity
-    # Overhead control: with many parallel runs, wandb's per-run background system-stats monitor
-    # (a thread polling CPU/mem every few seconds + periodic network posts) and metadata/code/git
-    # scans add up to N times the cost for no benefit here -- we only log our own scalar metrics.
-    # Disable them. Kept: the actual metric logging (one buffered, non-blocking log() per iteration).
-    settings = wandb.Settings(
-        sweep_id=sweep_id,
-        x_disable_stats=True,        # no per-run system-metrics monitor thread / posts
-        x_disable_meta=True,         # skip machine/git/code metadata collection at init
-        disable_git=True,
-        disable_code=True,
-    )
-    return wandb.init(
-        project=cfg.logging.wandb_project,
-        entity=entity if entity else None,
-        # no explicit `name`/`group`: wandb assigns its default generated name and the swept params
-        # are already stored in config, so nothing needs to be baked into the name or a group.
-        job_type="train",
-        config=OmegaConf.to_container(cfg, resolve=True),
-        mode=cfg.logging.wandb_mode,
-        settings=settings,
-        reinit=True,
-    )
+    if not _OWNED_SWEEP:
+        return
+    wandb_logging.set_sweep_state(_OWNED_SWEEP["id"], "FINISHED", entity=_OWNED_SWEEP["entity"],
+                                  project=_OWNED_SWEEP["project"], mode=_OWNED_SWEEP["mode"])
 
 
 def _configure_worker_logging(output_dir: str, seed: int, log_level: str = "INFO") -> None:
@@ -591,7 +582,10 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
     sweep_id = get_or_create_wandb_sweep(cfg)
     logger.info(f"Program started (seed={cfg.sweep.random_seed}, combo={combo}, sweep_id={sweep_id})")
 
-    run = _init_wandb(cfg, sweep_id)
+    # Staggered + retried init, then a buffered logger that chunks metric pushes and swallows wandb
+    # errors -- so neither a 429 at init nor one mid-training can take the training run down.
+    run = wandb_logging.init_run(cfg, sweep_id, cfg.sweep.random_seed)
+    wandb_run = wandb_logging.logger_for(cfg, run, label=f"seed{cfg.sweep.random_seed}")
 
     try:
         # Setup dataloader and 3-way split (computed once, reused for MPS + QCBM)
@@ -635,7 +629,7 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
             cfg.qcbm.iterations, cfg.qcbm.N_shots, cfg.qcbm.mmd_batch_fraction,
             cfg.qcbm.loss_func, cfg.qcbm.sigmas,
             eval_every=cfg.qcbm.eval_every, model_selection_metric=cfg.qcbm.model_selection_metric,
-            wandb_run=run,
+            wandb_run=wandb_run,
             dataset_kind=cfg.data.dataset,
             valid_patterns=(dataloader.dataset.binary if cfg.data.dataset == "BAS" else None),
             baseline_circuit=linear_circuit, baseline_params=linear_params,
@@ -644,21 +638,28 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
         # Save model + checkpoint
         qcbm.save(save_dir)
 
-        # Upload artifact and record best-model summary for the selection step.
-        if run is not None:
-            import wandb
-            run.summary["best_mmd_val"] = qcbm.best_metric
-            run.summary["best_iter"] = qcbm.best_iter
-            run.summary["total_measurements"] = qcbm.total_measurements
-            artifact = wandb.Artifact(f"qcbm_{run.id}", type="model",
-                                      metadata={"seed": cfg.sweep.random_seed, "combo": combo})
-            artifact.add_file(f"{save_dir}/circuit.qpy")
-            artifact.add_file(f"{save_dir}/best_params.npy")
-            artifact.add_file(f"{save_dir}/final_params.npy")
-            run.log_artifact(artifact, aliases=[f"seed{cfg.sweep.random_seed}"])
+        # Record the best-model summary for the selection step, plus the local save_dir as the
+        # fallback source for checkpoints if the artifact upload below is refused
+        # (benchmark.load_checkpoint uses it). One batched update, not three server round-trips.
+        wandb_run.summary({"best_mmd_val": qcbm.best_metric,
+                           "best_iter": qcbm.best_iter,
+                           "total_measurements": qcbm.total_measurements,
+                           "save_dir": os.path.abspath(save_dir)})
+
+        # Model artifact -- the heaviest per-run burst of API calls in a sweep (create + per-file
+        # upload + commit), and runs doing identical work all reach it at the same time, so it is
+        # staggered like init and skippable entirely (logging.wandb_log_artifacts); the same files
+        # stay on disk in save_dir either way, which benchmark.load_checkpoint falls back to.
+        if cfg.logging.wandb_log_artifacts and wandb_run.run_id is not None:
+            wandb_logging.stagger(cfg, cfg.sweep.random_seed, "artifact")
+            wandb_run.log_artifact(
+                f"qcbm_{wandb_run.run_id}",
+                [f"{save_dir}/circuit.qpy", f"{save_dir}/best_params.npy",
+                 f"{save_dir}/final_params.npy"],
+                metadata={"seed": cfg.sweep.random_seed, "combo": combo},
+                aliases=[f"seed{cfg.sweep.random_seed}"])
 
         logger.info("Program finished")
         logger.info(f"Program execution time: {round((time.time() - start_time) / 60, 2)} minutes")
     finally:
-        if run is not None:
-            run.finish()
+        wandb_run.finish()  # final flush of buffered rows, then close the run
