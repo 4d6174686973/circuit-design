@@ -39,9 +39,9 @@ circuit:
 
 ### QCBM setup ###
 qcbm:
-  iterations: 1000               # number of training iterations
+  iterations: 100               # number of training iterations
   mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
-  N_shots: 2000                   # number of shots in sampling
+  N_shots: 1000                   # number of shots in sampling
   loss_func: MMD                  # MMD, KL (KL not working yet)
   sigmas: [0.25, 1.0, 4.0, 16.0]  # Bandwidth for MMD Kernel
   finite_diff_epsilon: 1.0e-8     # epsilon used in finite difference sampling for KL (does not work yet)
@@ -65,7 +65,7 @@ logging:
   log_level: WARNING              # INFO (verbose, default) or WARNING (quiet -- real/production runs)
 
   # --- wandb request-rate control (src/wandb_logging.py) ---
-  wandb_flush_every: 100          # buffered iteration rows per push (1 = push every iteration)
+  wandb_flush_every: 10          # buffered iteration rows per push (1 = push every iteration)
   wandb_flush_interval_s: 300.0   # also push if this long since the last push (slow-iteration runs)
   wandb_transmit_interval_s: 60.0 # wandb-core filestream transmit interval (dashboard lag <= this)
   wandb_heartbeat_s: 30           # run keepalive interval; raising it cuts the per-run request floor
