@@ -329,6 +329,62 @@ def evaluate(samples: dict, splits: dict, dataset_kind: str, sigmas=np.array([1.
 
 
 # --------------------------------------------------------------------------------------------------
+# wandb fetch caches
+#
+# Every figure/table in a plotting pass is derived from the SAME sweep, so the run list and the
+# per-run parsed config are fetched/parsed once per process and reused. Caches are keyed on
+# identities that are immutable for a finished run (sweep path, run id) and are only ever additive,
+# so the only thing they can miss is a run that started/finished mid-pass -- call reset_wandb_cache()
+# if you need to re-read a live sweep in a long-running session (e.g. a notebook).
+# --------------------------------------------------------------------------------------------------
+_API = None                # wandb.Api() (its construction + default_entity lookup hit the network)
+_SWEEP_RUNS_CACHE = {}     # (entity, project, sweep_id) -> [Run]
+_CFG_CACHE = {}            # run.id -> parsed config (from_run_config)
+
+
+def wandb_api():
+    """The process-wide wandb.Api() instance (constructing one per call re-does auth/lookup work)."""
+    global _API
+    if _API is None:
+        import wandb
+        _API = wandb.Api()
+    return _API
+
+
+def sweep_runs(sweep_id: str, entity: str, project: str) -> list:
+    """Materialized run list of a sweep -- ONE wandb query per (entity, project, sweep) per process.
+
+    `Sweep.runs` is already a materialized list server-side, but re-requesting it per figure is
+    the single most expensive redundant fetch in a plotting pass, so it is cached here.
+    """
+    api = wandb_api()
+    entity = entity or api.default_entity  # unresolved None would literally build ".../None/..."
+    key = (entity, project, sweep_id)
+    if key not in _SWEEP_RUNS_CACHE:
+        _SWEEP_RUNS_CACHE[key] = list(api.sweep(f"{entity}/{project}/{sweep_id}").runs)
+    return _SWEEP_RUNS_CACHE[key]
+
+
+def run_config(run):
+    """Parsed (schema-validated) config of a run, cached by run id.
+
+    Raises whatever from_run_config raises for a config predating the current schema; callers that
+    want to skip such runs catch it (see _group_runs, plotting.fetch_runs).
+    """
+    if run.id not in _CFG_CACHE:
+        _CFG_CACHE[run.id] = from_run_config(run.config)
+    return _CFG_CACHE[run.id]
+
+
+def reset_wandb_cache():
+    """Drop the cached api/run-list/config state (use when re-reading a sweep that is still running)."""
+    global _API
+    _API = None
+    _SWEEP_RUNS_CACHE.clear()
+    _CFG_CACHE.clear()
+
+
+# --------------------------------------------------------------------------------------------------
 # best-model selection across a wandb group
 # --------------------------------------------------------------------------------------------------
 def select_best_run(runs: list, metric: str = "best_mmd_val"):
@@ -425,15 +481,87 @@ def _test_split_for_config(cfg) -> tuple:
     return {"val": c_val, "test": c_test}, valid_patterns, c_train
 
 
-def _evaluate_run(run, n_shots: int) -> dict:
-    """Load one run's best checkpoint, sample it, and evaluate the full held-out test metric suite.
+_CONNECTIONS_CACHE = {}  # config fingerprint -> new-connection count
+
+
+def extension_new_connection_count(cfg):
+    """Number of NEW two-qubit connections a run's extension adds on top of the linear baseline.
+
+    Training runs don't log this, so it is reconstructed from the config -- mirroring
+    setup.setup_circuit_extensions' topology selection exactly (same helpers, same
+    `linear_topology(range(N_qubits))` baseline, same set-difference as extend_circuit) but without
+    building a circuit, so the count matches what actually trained. Returns None for an unrecognized
+    extension rather than guessing.
+
+    `random` needs no RNG here: setup sizes it to exactly match metric_based's NEW-connection count,
+    so that count IS the answer. Cached per distinct dataset/extension config, since the dataset
+    reconstruction (needed only by the data-driven topologies) is the expensive part.
+    """
+    from src.setup import setup_dataloader, compute_split, _metric_based_connections
+    from src.extension import (linear_topology, all_to_all_topology, nearest_neighbor_topology,
+                               chow_liu_topology)
+    from src.utils import mutual_info_matrix
+
+    extension = cfg.circuit.extension
+    key = (extension, cfg.data.dataset, cfg.data.N_qubits, cfg.data.width, cfg.data.height,
+           cfg.circuit.extension_metric, cfg.circuit.threshold_rule, cfg.circuit.threshold,
+           cfg.data.train_split, cfg.data.val_split, cfg.data.bas_split_mode,
+           cfg.sweep.initial_random_seed)
+    if key in _CONNECTIONS_CACHE:
+        return _CONNECTIONS_CACHE[key]
+
+    init_connections = linear_topology(list(range(cfg.data.N_qubits)))
+    if extension == "none":
+        extension_connections = []
+    elif extension == "all_to_all":
+        extension_connections = all_to_all_topology(cfg.data.N_qubits)
+    elif extension == "nearest_neighbor":
+        extension_connections = nearest_neighbor_topology(cfg.data.width, cfg.data.height)
+    elif extension in ("metric_based", "random", "chow_liu"):
+        # the data-driven topologies need the same train split training used (compute_split keys on
+        # initial_random_seed, so every run of the sweep sees the identical split/topology)
+        X_train, *_ = compute_split(cfg, setup_dataloader(cfg))
+        if extension == "chow_liu":
+            extension_connections = chow_liu_topology(mutual_info_matrix(np.asarray(X_train)))
+        else:
+            extension_connections, _ = _metric_based_connections(
+                X_train, cfg.circuit.extension_metric, cfg.circuit.threshold_rule,
+                cfg.circuit.threshold)
+    else:
+        return None
+
+    n = len(set(extension_connections) - set(init_connections))
+    _CONNECTIONS_CACHE[key] = n
+    return n
+
+
+def _run_setup_facts(run) -> dict:
+    """Per-run architecture/cost facts for the setup table: parameter count, added connections, and
+    the total measurement/iteration cost actually spent. Summary keys are best-effort (a run predating
+    a logging change simply reports None, which bootstrap_group_metrics renders as NaN)."""
+    try:
+        n_connections = extension_new_connection_count(run_config(run))
+    except Exception as e:  # a config we can't reconstruct must not sink the whole benchmark
+        print(f"[benchmark]     [{run.id}] could not derive connection count: {e!r}")
+        n_connections = None
+    return {"num_parameters": run.summary.get("train/num_parameters"),
+            "n_connections": n_connections,
+            "total_measurements": run.summary.get("total_measurements"),
+            "iterations_run": run.summary.get("iterations_run")}
+
+
+def _evaluate_run(run, n_shots: int, which: str = "best") -> dict:
+    """Load one run's checkpoint, sample it, and evaluate the full held-out test metric suite.
+
+    `which` selects "best" (validation-selected, default) or "final" (last training iteration) --
+    see load_checkpoint.
 
     Returns the flat metric dict from `evaluate` (bench_dist/test/{mmd,kl,tv,fidelity}, bench_val/*,
     plus BAS-only bench_BAS/{precision,recall,qbas}). Shared by benchmark_sweep (best-per-group) and
     benchmark_all_runs (every run) so a run is scored identically regardless of caller.
     """
-    circuit, params = load_checkpoint(run)
-    cfg = from_run_config(run.config)
+    circuit, params = load_checkpoint(run, which=which)
+    cfg = run_config(run)
     splits, valid_patterns, train_counts = _test_split_for_config(cfg)
     samples = sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
     return evaluate(samples, splits, cfg.data.dataset, sigmas=np.array(cfg.qcbm.sigmas),
@@ -441,14 +569,15 @@ def _evaluate_run(run, n_shots: int) -> dict:
 
 
 def _group_runs(sweep_id: str, entity: str, project: str, group_by: str) -> dict:
-    """{group_key: [runs]} for a sweep, skipping runs whose config predates the current schema."""
-    import wandb
-    api = wandb.Api()
-    entity = entity or api.default_entity  # unresolved None would literally build ".../None/..."
+    """{group_key: [runs]} for a sweep, skipping runs whose config predates the current schema.
+
+    Uses the process-wide sweep_runs/run_config caches, so calling this repeatedly (or alongside
+    plotting.fetch_runs) costs exactly one wandb sweep query per sweep.
+    """
     groups = {}
-    for r in api.sweep(f"{entity}/{project}/{sweep_id}").runs:
+    for r in sweep_runs(sweep_id, entity, project):
         try:
-            key = OmegaConf.select(from_run_config(r.config), group_by)
+            key = OmegaConf.select(run_config(r), group_by)
         except Exception as e:
             print(f"[benchmark]     skipping run {r.id}: config incompatible with current schema ({e})")
             continue
@@ -457,15 +586,20 @@ def _group_runs(sweep_id: str, entity: str, project: str, group_by: str) -> dict
 
 
 def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
-                    n_shots: int = 10000, metric: str = "best_mmd_val") -> pd.DataFrame:
+                    n_shots: int = 10000, metric: str = "best_mmd_val",
+                    groups: dict = None, which: str = "best") -> pd.DataFrame:
     """Benchmark the best model per group of a sweep (point estimate, one row per group).
 
     For each group (value of `group_by`, a dot-separated path into the run's config, e.g.
-    "circuit.extension"), select the seed-run with the lowest validation MMD, load its best
-    checkpoint, sample it, and evaluate the full metric suite on the held-out test split. For a
-    bootstrap over ALL runs (mean +/- std across seeds) use benchmark_all_runs instead.
+    "circuit.extension"), select the seed-run with the lowest validation MMD, load its checkpoint
+    (`which`: "best" validation-selected iteration, or "final" -- see load_checkpoint), sample it,
+    and evaluate the full metric suite on the held-out test split. For a bootstrap over ALL runs
+    (mean +/- std across seeds) use benchmark_all_runs instead.
+
+    `groups` optionally supplies an already-fetched {group_key: [runs]} mapping (e.g. from
+    plotting.fetch_runs), skipping the sweep query entirely.
     """
-    groups = _group_runs(sweep_id, entity, project, group_by)
+    groups = groups if groups is not None else _group_runs(sweep_id, entity, project, group_by)
     rows = []
     for key, group_runs in groups.items():
         print(f"[benchmark]     [{key}] {len(group_runs)} run(s) -> selecting best by {metric}...")
@@ -476,37 +610,45 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "c
         print(f"[benchmark]     [{key}] best run {best.id} ({metric}={best.summary.get(metric)}); "
               f"evaluating checkpoint...")
         row = {group_by: key, "run_id": best.id, "run_name": best.name,
-               "best_mmd_val": best.summary.get(metric)}
-        row.update(_evaluate_run(best, n_shots))
+               "best_mmd_val": best.summary.get(metric), **_run_setup_facts(best)}
+        row.update(_evaluate_run(best, n_shots, which=which))
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def benchmark_all_runs(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
-                       n_shots: int = 10000, metric: str = "best_mmd_val") -> pd.DataFrame:
-    """Evaluate EVERY run's best checkpoint on the held-out test split (not just the per-group best).
+                       n_shots: int = 10000, metric: str = "best_mmd_val",
+                       groups: dict = None, which: str = "best") -> pd.DataFrame:
+    """Evaluate EVERY run's checkpoint on the held-out test split (not just the per-group best).
 
-    Returns a tidy table with ONE ROW PER RUN (group_by, run_id, run_name, best_mmd_val, + the full
-    held-out metric suite), so downstream code (plotting.bootstrap_group_metrics) can bootstrap the
-    metrics across the runs of each group -- the mean +/- across-seed standard error. Each run is
-    scored identically to benchmark_sweep (best checkpoint, same n_shots), so the per-group best row
-    of this table matches benchmark_sweep's point estimate.
+    `which` selects "best" (validation-selected, default) or "final" (last training iteration) for
+    EVERY run's checkpoint -- see load_checkpoint.
+
+    Returns a tidy table with ONE ROW PER RUN (group_by, run_id, run_name, best_mmd_val,
+    num_parameters, + the full held-out metric suite), so downstream code
+    (plotting.bootstrap_group_metrics) can bootstrap the metrics across the runs of each group --
+    the mean +/- across-seed standard error. Each run is scored identically to benchmark_sweep (same
+    `which` checkpoint, same n_shots), so the per-group best row of this table matches
+    benchmark_sweep's point estimate.
 
     Runs with an incompatible config or no usable checkpoint are skipped with a warning rather than
     aborting the whole benchmark.
+
+    `groups` optionally supplies an already-fetched {group_key: [runs]} mapping (e.g. from
+    plotting.fetch_runs), skipping the sweep query entirely.
     """
-    groups = _group_runs(sweep_id, entity, project, group_by)
+    groups = groups if groups is not None else _group_runs(sweep_id, entity, project, group_by)
     rows = []
     for key, group_runs in groups.items():
         print(f"[benchmark]     [{key}] evaluating {len(group_runs)} run(s) @ {n_shots} shots...")
         for i, r in enumerate(group_runs):
             try:
-                metrics = _evaluate_run(r, n_shots)
+                metrics = _evaluate_run(r, n_shots, which=which)
             except Exception as e:  # one bad run must not sink the whole group
                 print(f"[benchmark]     [{key}] skipping run {r.id}: {e!r}")
                 continue
             row = {group_by: key, "run_id": r.id, "run_name": r.name,
-                   "best_mmd_val": r.summary.get(metric)}
+                   "best_mmd_val": r.summary.get(metric), **_run_setup_facts(r)}
             row.update(metrics)
             rows.append(row)
     return pd.DataFrame(rows)

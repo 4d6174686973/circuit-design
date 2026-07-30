@@ -214,29 +214,39 @@ def plot_jgb_binary_histograms(N_qubits=12, N_features=3, plots_dir: str = "plot
 # thresholding / extension figures (reordered train split -- must match the qubit indices setup.py
 # actually builds the circuit on)
 # --------------------------------------------------------------------------------------------------
-def plot_threshold_curve(thresholds: np.ndarray, counts: np.ndarray, knee: float, percolation: float,
-                         selected_rule: str = "knee", plots_dir: str = "plots",
-                         filename: str = "threshold_curve", save: bool = True):
-    """Connections-vs-threshold curve for the metric_based extension, with both the knee and the
-    bond-percolation thresholds marked (both are always computed regardless of
-    cfg.circuit.threshold_rule; the one actually selected by that rule is highlighted)."""
-    rule_thresholds = {"knee": knee, "percolation": percolation}
-    fig, ax = plt.subplots(figsize=(4, 2))
-    ax.plot(thresholds, counts, color=OKABE_ITO["blue"])
-    for rule, color in (("knee", OKABE_ITO["vermillion"]), ("percolation", OKABE_ITO["orange"])):
-        threshold = rule_thresholds[rule]
-        threshold_idx = int(np.argmin(np.abs(thresholds - threshold)))
-        threshold_count = int(counts[threshold_idx])
-        is_selected = rule == selected_rule
-        label = f"{rule} @ {threshold:.3f} ({threshold_count} conn.)"
-        if is_selected:
-            label += " [selected]"
-        ax.axvline(threshold, color=color, ls="--" if is_selected else ":",
-                  lw=1.2 if is_selected else 1, label=label)
-    # let matplotlib place the legend clear of the data instead of hand-picking annotation
-    # offsets, which overlap whenever the two thresholds happen to land close together
-    ax.legend(fontsize=6, loc="best", frameon=True, framealpha=0.85)
-    ax.set_xlabel("Threshold"); ax.set_ylabel("Number of Connections")
+def plot_threshold_curve(curves: dict, selected_rule: str = "knee", selected_metric: str = None,
+                         plots_dir: str = "plots", filename: str = "threshold_curve", save: bool = True):
+    """Connections-vs-threshold curves for the metric_based extension, one subplot per distance
+    metric (e.g. hamming and varinfo), so both are visible side by side regardless of which metric
+    the dataset config actually uses. `curves` maps metric name -> (thresholds, counts, knee,
+    percolation). Both the knee and bond-percolation thresholds are always marked in each subplot;
+    the one actually selected by cfg.circuit.threshold_rule is highlighted. The subplot for
+    `selected_metric` (the metric the dataset config actually uses) is marked in its title."""
+    metrics = list(curves.keys())
+    fig, axs = plt.subplots(1, len(metrics), figsize=(3 * len(metrics), 2), squeeze=False)
+    axs = axs[0]
+    for ax, metric in zip(axs, metrics):
+        thresholds, counts, knee, percolation = curves[metric]
+        rule_thresholds = {"knee": knee, "percolation": percolation}
+        ax.plot(thresholds, counts, color=OKABE_ITO["blue"])
+        for rule, color in (("knee", OKABE_ITO["vermillion"]), ("percolation", OKABE_ITO["orange"])):
+            threshold = rule_thresholds[rule]
+            threshold_idx = int(np.argmin(np.abs(thresholds - threshold)))
+            threshold_count = int(counts[threshold_idx])
+            is_selected = rule == selected_rule
+            label = f"{rule} @ {threshold:.3f} ({threshold_count} conn.)"
+            if is_selected:
+                label += " [selected]"
+            ax.axvline(threshold, color=color, ls="--" if is_selected else ":",
+                      lw=1.2 if is_selected else 1, label=label)
+        # let matplotlib place the legend clear of the data instead of hand-picking annotation
+        # offsets, which overlap whenever the two thresholds happen to land close together
+        ax.legend(fontsize=6, loc="best", frameon=True, framealpha=0.85)
+        title = _METRIC_LABELS.get(metric, metric)
+        if metric == selected_metric:
+            title += " [selected]"
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel("Threshold"); ax.set_ylabel("Number of Connections")
     plt.tight_layout()
     if save:
         _save(fig, plots_dir, filename)
@@ -340,10 +350,19 @@ def generate_extension_figures(cfg, plots_dir: str = "plots") -> float:
     X_train, *_ = compute_split(cfg, dl)  # exact reordered train split setup.py trains the circuit on
 
     distmat = feature_distance_matrix(X_train, cfg.circuit.extension_metric)
-    thresholds, counts = connection_threshold_curve(distmat)
-    knee = knee_threshold(distmat)
-    percolation = percolation_threshold(distmat)
     threshold = select_threshold(distmat, rule)
+
+    # threshold curves are computed for every distance metric (not just the one the dataset config
+    # actually uses) so plot_threshold_curve can show them side by side for comparison
+    curves = {}
+    for metric in _METRIC_LABELS:
+        metric_distmat = distmat if metric == cfg.circuit.extension_metric else \
+            feature_distance_matrix(X_train, metric)
+        metric_thresholds, metric_counts = connection_threshold_curve(metric_distmat)
+        curves[metric] = (metric_thresholds, metric_counts, knee_threshold(metric_distmat),
+                          percolation_threshold(metric_distmat))
+
+    thresholds, counts, *_ = curves[cfg.circuit.extension_metric]
     threshold_idx = int(np.argmin(np.abs(thresholds - threshold)))
     print(f"[plot_extension] {dataset_folder(cfg)}: {rule} threshold = {threshold:.4f} "
          f"({int(counts[threshold_idx])} connections) -> {folder}/")
@@ -357,7 +376,8 @@ def generate_extension_figures(cfg, plots_dir: str = "plots") -> float:
                           cfg.data.val_split, plots_dir=folder)
         plot_jgb_binary_histograms(cfg.data.N_qubits, cfg.data.N_features, plots_dir=folder)
 
-    plot_threshold_curve(thresholds, counts, knee, percolation, selected_rule=rule, plots_dir=folder)
+    plot_threshold_curve(curves, selected_rule=rule, selected_metric=cfg.circuit.extension_metric,
+                        plots_dir=folder)
     plot_extension_heatmap(distmat, threshold, rule=rule, plots_dir=folder,
                            metric_label=_METRIC_LABELS[cfg.circuit.extension_metric])
     plot_topology_panel(cfg, X_train, distmat, threshold, rule=rule, plots_dir=folder)

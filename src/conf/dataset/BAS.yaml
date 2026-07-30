@@ -8,3 +8,4 @@ data:
   bas_split_mode: holdout         # full_support (all patterns in every split) or holdout (seeded disjoint partition)
 circuit:
   extension_metric: hamming       # hamming, varinfo
+  threshold_rule: percolation     # knee, percolation -- how metric_based auto-selects its threshold
