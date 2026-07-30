@@ -39,7 +39,7 @@ circuit:
 ### QCBM setup ###
 qcbm:
   mode: measurements                # iterations, measurements
-  measurement_budget: 5e8         # 2e8; only used when mode=measurements
+  measurement_budget: 1e10         # 2e8; only used when mode=measurements
   iterations: 100                 # number of training iterations; only when mode=iterations
   mmd_batch_fraction: 0.0         # fraction of training samples used for each gradient update
   N_shots: 2000                   # number of shots in sampling
