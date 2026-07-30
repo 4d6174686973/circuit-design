@@ -648,11 +648,10 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
         circuit, params = bm.load_checkpoint(best, which=which)
         samples = bm.sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
         splits, _, _ = bm._test_split_for_config(cfg)
-        jgb = JGB(cfg.data.N_qubits, cfg.data.N_features); dl = DataLoader(jgb)
+        jgb = JGB(cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer); dl = DataLoader(jgb)
         dl.train_val_test_split(cfg.data.train_split, cfg.data.val_split)
-        xmin, xmax = dl.conv_min_max
         bpf = jgb.bits_per_feature
-        feats = bm.reconstruct_features(samples, bpf, cfg.data.N_features, xmin, xmax)
+        feats = bm.reconstruct_features(samples, bpf, cfg.data.N_features, quantizer=dl.quantizer)
         data = jgb.decimal.values
         fig, axs = plt.subplots(1, cfg.data.N_features, figsize=(3 * cfg.data.N_features, 3))
         for i, ax in enumerate(np.atleast_1d(axs)):

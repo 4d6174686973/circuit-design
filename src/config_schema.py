@@ -25,7 +25,8 @@ class DataConfig:
     bas_split_mode: str = "full_support"   # full_support (all patterns in every split) or holdout (seeded disjoint partition)
     width: int = 3                         # width of the BAS image
     height: int = 3                        # height of the BAS image
-    N_features: int = 3                    # number of features for JGB dataset, 3 or 4
+    N_features: int = 3                    # number of features for JGB dataset, 2, 3 or 4
+    quantizer: str = "minmax"              # JGB real->binary encoding: minmax or arcsinh
 
 
 @dataclass

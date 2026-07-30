@@ -3,7 +3,10 @@
 data:
   dataset: JGB
   N_qubits: 12                    # number of qubits
-  N_features: 3                   # number of features for JGB dataset, 3 or 4
+  N_features: 3                   # number of features for JGB dataset, 2, 3 or 4
+  quantizer: minmax              # real->binary encoding: minmax (uniform bins) or arcsinh
+                                  # (variance-stabilizing warp, then uniform bins). arcsinh uses
+                                  # ~2x more of the 2**bits code space on heavy-tailed yield diffs.
 circuit:
   extension_metric: varinfo       # hamming, varinfo
   threshold_rule: knee            # knee, percolation -- how metric_based auto-selects its threshold

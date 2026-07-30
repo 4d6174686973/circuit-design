@@ -216,21 +216,29 @@ def generalization_metrics(samples: dict, train_patterns, valid_patterns=None) -
 # JGB-specific metrics (binarized continuous, per feature)
 # --------------------------------------------------------------------------------------------------
 def reconstruct_features(samples: dict, bits_per_feature: int, num_features: int,
-                         x_min, x_max) -> list:
+                         x_min=None, x_max=None, quantizer=None) -> list:
     """Reconstruct per-feature real-valued marginals from a model-sample dict.
 
-    Returns a list of (values, probs) per feature, using the train-fitted x_min/x_max bounds so the
-    inversion matches the (leakage-safe) encoding used for training/eval.
+    Returns a list of (values, probs) per feature, inverting with the train-fitted quantizer so the
+    reconstruction matches the (leakage-safe) encoding used for training/eval.
+
+    Pass `quantizer` (DataLoader.quantizer after train_val_test_split) whenever available -- it is
+    REQUIRED for the arcsinh encoding, whose bounds live in warped space. The x_min/x_max form is
+    the legacy path and is only correct for the affine "minmax" encoding.
     """
     feat_dicts = get_features_for_quasi_dist(samples, bits_per_feature, num_features)
-    denom = 2 ** bits_per_feature - 1
+    if quantizer is None:
+        if x_min is None or x_max is None:
+            raise ValueError("reconstruct_features needs either quantizer= or x_min/x_max")
+        from src.utils import FeatureQuantizer
+        quantizer = FeatureQuantizer("minmax", bits_per_feature,
+                                     np.asarray(x_min, dtype=float),
+                                     np.asarray(x_max, dtype=float))
     out = []
     for n, fdict in enumerate(feat_dicts):
         vals, probs = [], []
         for bitstring, p in fdict.items():
-            integer = int(bitstring, 2)
-            real = x_min[n] + integer * (x_max[n] - x_min[n]) / denom
-            vals.append(real)
+            vals.append(float(quantizer.decode_levels(int(bitstring, 2), n)))
             probs.append(p)
         out.append((np.array(vals), np.array(probs)))
     return out
@@ -280,15 +288,21 @@ def independent_bits_baseline(target: dict, n_bits: int, n_samples: int, seed: i
 
 
 def gaussian_baseline_jgb(decimal_train: np.ndarray, bits_per_feature: int, n_features: int,
-                          n_samples: int, x_min, x_max, seed: int = 0) -> dict:
-    """Independent per-tenor Gaussian fitted on train decimals, re-binarized with train bounds."""
+                          n_samples: int, x_min=None, x_max=None, seed: int = 0,
+                          quantizer=None) -> dict:
+    """Independent per-tenor Gaussian fitted on train decimals, re-encoded with the train quantizer.
+
+    Pass `quantizer` (DataLoader.quantizer) so the baseline is discretized exactly like the data;
+    the x_min/x_max form is the legacy "minmax"-only path.
+    """
     from src.utils import real_to_binary
     from collections import Counter
     rng = np.random.default_rng(seed)
     mean = decimal_train.mean(axis=0)
     std = decimal_train.std(axis=0)
     samples_real = rng.normal(mean, std, size=(n_samples, n_features))
-    binary, _ = real_to_binary(samples_real, bits_per_feature, x_min, x_max, clip=True)
+    binary, _ = real_to_binary(samples_real, bits_per_feature, x_min, x_max, clip=True,
+                               quantizer=quantizer)
     return dict(Counter(array_to_str(binary)))
 
 
@@ -469,7 +483,7 @@ def _test_split_for_config(cfg) -> tuple:
     if cfg.data.dataset == "BAS":
         dataset = BAS(cfg.data.width, cfg.data.height)
     else:
-        dataset = JGB(cfg.data.N_qubits, cfg.data.N_features)
+        dataset = JGB(cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer)
     dl = DataLoader(dataset)
     # Reconstruct the SAME split training used: keyed on initial_random_seed (see
     # setup.compute_split), not the per-run random_seed, so the held-out val/test targets match the
@@ -503,7 +517,10 @@ def extension_new_connection_count(cfg):
     from src.utils import mutual_info_matrix
 
     extension = cfg.circuit.extension
+    # N_features and quantizer belong in the key: both change the JGB encoding, hence the
+    # bit-level statistics the data-driven topologies (metric_based/chow_liu) are selected from
     key = (extension, cfg.data.dataset, cfg.data.N_qubits, cfg.data.width, cfg.data.height,
+           cfg.data.N_features, cfg.data.quantizer,
            cfg.circuit.extension_metric, cfg.circuit.threshold_rule, cfg.circuit.threshold,
            cfg.data.train_split, cfg.data.val_split, cfg.data.bas_split_mode,
            cfg.sweep.initial_random_seed)

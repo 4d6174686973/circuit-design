@@ -6,7 +6,7 @@ from typing import Union
 from hydra.utils import to_absolute_path
 
 # Own modules
-from src.utils import real_to_binary, array_to_str
+from src.utils import FeatureQuantizer, array_to_str
 
 # Global variables
 jgb_data_path = to_absolute_path("data/jgbcme_all.csv")  # publicly accessible on website of ministry of finance Japan, see readme
@@ -86,7 +86,7 @@ class JGB:
     binary: np.ndarray
     conv_min_max: list[float]
 
-    def __init__(self, N_qubits: int, N_features: int):
+    def __init__(self, N_qubits: int, N_features: int, quantizer: str = "minmax"):
         df = pd.read_csv(jgb_data_path, skiprows=1, index_col=0, parse_dates=True)
         df = df.apply(pd.to_numeric, errors='coerce')  # convert str to float
         df = df.loc['2000-01-01':]  # low interest rate regime
@@ -96,6 +96,8 @@ class JGB:
             df = df[['2Y','5Y','10Y','20Y']]
         elif N_features == 3:
             df = df[['5Y','10Y','20Y']]
+        elif N_features == 2:
+            df = df[['2Y','10Y']]
         else:
             raise ValueError("Number of features not supported.")
 
@@ -105,10 +107,13 @@ class JGB:
         self.decimal = df.copy()
         self.N_features = N_features
         self.bits_per_feature = N_qubits // N_features
-        # NOTE: this full-series binarization fits its min/max on ALL rows and is therefore NOT
-        # leakage-safe. It is kept only for exploratory use and dataset figures. Training/eval
-        # must use DataLoader.train_val_test_split, which re-binarizes JGB with train-only bounds.
-        self.binary, self.conv_min_max = real_to_binary(self.decimal.values, self.bits_per_feature)
+        self.quantizer_kind = quantizer  # "minmax" | "arcsinh"; see utils.FeatureQuantizer
+        # NOTE: this full-series quantizer is fitted on ALL rows and is therefore NOT leakage-safe.
+        # It is kept only for exploratory use and dataset figures. Training/eval must use
+        # DataLoader.train_val_test_split, which refits the quantizer on the train slice only.
+        self.quantizer = FeatureQuantizer.fit(self.decimal.values, self.bits_per_feature, quantizer)
+        self.binary = self.quantizer.encode(self.decimal.values)
+        self.conv_min_max = self.quantizer.conv_min_max
 
 
 @dataclass
@@ -121,7 +126,10 @@ class DataLoader:
         self.dataset = dataset
         self.binary = dataset.binary
         self.count = Counter(array_to_str(dataset.binary))
-        # per-feature binarization bounds fitted on the train split (JGB); set by train_val_test_split
+        # per-feature quantizer fitted on the train split (JGB); set by train_val_test_split.
+        # conv_min_max holds its bounds -- in WARPED space for the arcsinh quantizer, so use
+        # self.quantizer.decode(...) for inversion rather than an affine map off these bounds.
+        self.quantizer = None
         self.conv_min_max = None
     
     def reorder_features(self, X: np.ndarray) -> np.ndarray:
@@ -149,9 +157,10 @@ class DataLoader:
         The test fraction is implied as 1 - train_size - val_size.
 
         - JGB (time series): contiguous chronological blocks (train = earliest, val = next,
-          test = most recent). Binarization bounds are fitted on the TRAIN slice only and reused
-          (with clipping) for val/test, so no future information leaks into the encoding. The
-          fitted bounds are stored on self.conv_min_max for later inversion (binary_to_real).
+          test = most recent). The quantizer (minmax or arcsinh, see utils.FeatureQuantizer) is
+          fitted on the TRAIN slice only and reused (with clipping) for val/test, so no future
+          information leaks into the encoding. The fitted quantizer is stored on self.quantizer
+          for later inversion (quantizer.decode / benchmark.reconstruct_features).
         - BAS (finite enumerable support):
             * "full_support" (default): train/val/test are all the complete enumerated pattern set
               (the standard QCBM/BAS evaluation, where generalization = mode coverage).
@@ -177,12 +186,12 @@ class DataLoader:
         val_dec = decimal[N_train:N_train + N_val]
         test_dec = decimal[N_train + N_val:]
 
-        # fit discretization bounds on the train slice only, reuse (clipped) for val/test
-        _, [x_min, x_max] = real_to_binary(train_dec, bpf)
-        self.conv_min_max = [x_min, x_max]
-        X_train, _ = real_to_binary(train_dec, bpf, x_min, x_max, clip=True)
-        X_val, _ = real_to_binary(val_dec, bpf, x_min, x_max, clip=True)
-        X_test, _ = real_to_binary(test_dec, bpf, x_min, x_max, clip=True)
+        # fit the quantizer on the train slice only, reuse it (clipped) for val/test
+        self.quantizer = FeatureQuantizer.fit(train_dec, bpf, self.dataset.quantizer_kind)
+        self.conv_min_max = self.quantizer.conv_min_max
+        X_train = self.quantizer.encode(train_dec, clip=True)
+        X_val = self.quantizer.encode(val_dec, clip=True)
+        X_test = self.quantizer.encode(test_dec, clip=True)
 
         if reorder:  # no-op for JGB, kept for interface symmetry
             X_train, X_val, X_test = (self.reorder_features(a) for a in (X_train, X_val, X_test))
@@ -190,7 +199,8 @@ class DataLoader:
 
     def _split_bas(self, train_size, val_size, reorder, seed, bas_split_mode):
         X = self.reorder_features(self.binary) if reorder else self.binary
-        # BAS binarization has no fitted bounds; keep min/max at bit extremes for inversion symmetry
+        # BAS is natively binary -- no quantizer is fitted and none is needed for inversion
+        self.quantizer = None
         self.conv_min_max = None
 
         if bas_split_mode == "full_support":

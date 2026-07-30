@@ -68,7 +68,10 @@ def load_cfg(dataset: str):
 def dataset_folder(cfg) -> str:
     if cfg.data.dataset == "BAS":
         return f"BAS_{cfg.data.width}x{cfg.data.height}"
-    return f"JGB_{cfg.data.N_qubits}Q{cfg.data.N_features}F"
+    # the quantizer changes the encoding and therefore every JGB figure; suffix only when it is
+    # non-default so existing JGB_<n>Q<m>F plot paths keep working
+    suffix = "" if cfg.data.quantizer == "minmax" else f"_{cfg.data.quantizer}"
+    return f"JGB_{cfg.data.N_qubits}Q{cfg.data.N_features}F{suffix}"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -149,10 +152,10 @@ def plot_bas_images(width=3, height=3, train_split=0.5, val_split=0.25, seed=Non
 
 
 def plot_jgb_raw_data(N_qubits=12, N_features=3, train_split=0.5, val_split=0.25,
-                      plots_dir: str = "plots", save: bool = True):
+                      plots_dir: str = "plots", save: bool = True, quantizer: str = "minmax"):
     """Raw JGB yield series, shaded by the chronological train/val/test split (see
     DataLoader._split_jgb): train = earliest block, val = next, test = most recent."""
-    jgb = JGB(N_qubits, N_features)
+    jgb = JGB(N_qubits, N_features, quantizer)
     df0 = jgb.raw
     colors = categorical_colors(len(df0.columns))
     fig, ax = plt.subplots(1, 1, figsize=(5, 3))
@@ -190,15 +193,16 @@ def plot_jgb_raw_data(N_qubits=12, N_features=3, train_split=0.5, val_split=0.25
     return fig
 
 
-def plot_jgb_binary_histograms(N_qubits=12, N_features=3, plots_dir: str = "plots", save: bool = True):
+def plot_jgb_binary_histograms(N_qubits=12, N_features=3, plots_dir: str = "plots",
+                               save: bool = True, quantizer: str = "minmax"):
     from collections import Counter
     from qiskit.visualization import plot_histogram
-    jgb = JGB(N_qubits, N_features)
+    jgb = JGB(N_qubits, N_features, quantizer)
     bits_per_feature = N_qubits // N_features
     target_dict = Counter(array_to_str(jgb.binary))
     feat_dicts = get_features_for_quasi_dist(target_dict, bits_per_feature, N_features)
-    labels = ([f"{t}" for t in ["5-year", "10-year", "20-year"]] if N_features == 3
-              else ["2-year", "5-year", "10-year", "20-year"])
+    # derive from the columns JGB actually selected, so this stays correct for any feature subset
+    labels = [f"{c[:-1]}-year" for c in jgb.raw.columns]
     colors = categorical_colors(N_features)
     fig, axs = plt.subplots(N_features, 1, figsize=(5, 5))
     for i, ax in enumerate(np.atleast_1d(axs)):
@@ -398,8 +402,9 @@ def generate_extension_figures(cfg, plots_dir: str = "plots") -> float:
                         plots_dir=folder)
     else:
         plot_jgb_raw_data(cfg.data.N_qubits, cfg.data.N_features, cfg.data.train_split,
-                          cfg.data.val_split, plots_dir=folder)
-        plot_jgb_binary_histograms(cfg.data.N_qubits, cfg.data.N_features, plots_dir=folder)
+                          cfg.data.val_split, plots_dir=folder, quantizer=cfg.data.quantizer)
+        plot_jgb_binary_histograms(cfg.data.N_qubits, cfg.data.N_features, plots_dir=folder,
+                                   quantizer=cfg.data.quantizer)
 
     plot_threshold_curve(curves, selected_rule=rule, selected_metric=cfg.circuit.extension_metric,
                         plots_dir=folder)

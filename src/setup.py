@@ -283,7 +283,7 @@ def setup_dataloader(cfg: DictConfig) -> DataLoader:
     if cfg.data.dataset == "BAS":
         dataset = BAS(cfg.data.width, cfg.data.height)
     elif cfg.data.dataset == "JGB":
-        dataset = JGB(cfg.data.N_qubits, cfg.data.N_features)
+        dataset = JGB(cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer)
 
     return DataLoader(dataset)
 
