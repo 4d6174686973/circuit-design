@@ -2,10 +2,10 @@
 # Bars-and-stripes dataset. Select with `dataset=BAS` on the CLI or in scripts/sweep.sh.
 data:
   dataset: BAS
-  width: 4                        # width of the BAS image
+  width: 3                        # width of the BAS image
   height: 3                       # height of the BAS image
-  N_qubits: 12                    # width * height
+  N_qubits: 9                    # width * height
   bas_split_mode: holdout         # full_support (all patterns in every split) or holdout (seeded disjoint partition)
 circuit:
-  extension_metric: hamming       # hamming, varinfo
-  threshold_rule: percolation     # knee, percolation -- how metric_based auto-selects its threshold
+  extension_metric: varinfo       # hamming, varinfo
+  threshold_rule: knee     # knee, percolation -- how metric_based auto-selects its threshold
