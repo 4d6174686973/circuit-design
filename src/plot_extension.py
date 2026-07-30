@@ -335,6 +335,19 @@ def plot_topology_panel(cfg, X_train: np.ndarray, distmat: np.ndarray, threshold
     return fig
 
 
+def _connection_levels(thresholds: np.ndarray, counts: np.ndarray) -> list:
+    """Collapse the (thresholds, counts) step function from connection_threshold_curve into
+    (count, threshold_lo, threshold_hi) runs -- one per distinct connection count, spanning the
+    threshold interval over which that count holds."""
+    levels = []
+    start = 0
+    for i in range(1, len(counts) + 1):
+        if i == len(counts) or counts[i] != counts[start]:
+            levels.append((int(counts[start]), float(thresholds[start]), float(thresholds[i - 1])))
+            start = i
+    return levels
+
+
 # --------------------------------------------------------------------------------------------------
 # per-dataset driver
 # --------------------------------------------------------------------------------------------------
@@ -366,6 +379,18 @@ def generate_extension_figures(cfg, plots_dir: str = "plots") -> float:
     threshold_idx = int(np.argmin(np.abs(thresholds - threshold)))
     print(f"[plot_extension] {dataset_folder(cfg)}: {rule} threshold = {threshold:.4f} "
          f"({int(counts[threshold_idx])} connections) -> {folder}/")
+
+    # connection counts for every knee/percolation marker actually drawn on the threshold curve
+    # figure (both metrics, both rules), so the printed numbers always match what's plotted
+    for metric, (metric_thresholds, metric_counts, knee, percolation) in curves.items():
+        active = " [active]" if metric == cfg.circuit.extension_metric else ""
+        for label, value in (("knee", knee), ("percolation", percolation)):
+            idx = int(np.argmin(np.abs(metric_thresholds - value)))
+            print(f"[plot_extension]   {metric}{active} {label} @ {value:.4f} "
+                 f"({int(metric_counts[idx])} connections)")
+        print(f"[plot_extension]   {metric}{active} connection levels:")
+        for count, lo, hi in _connection_levels(metric_thresholds, metric_counts):
+            print(f"[plot_extension]     {count} connections for threshold in [{lo:.4f}, {hi:.4f}]")
 
     if dataset == "BAS":
         plot_bas_images(cfg.data.width, cfg.data.height, cfg.data.train_split, cfg.data.val_split,

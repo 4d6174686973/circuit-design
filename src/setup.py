@@ -1,7 +1,9 @@
 import pandas as pd
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
+import contextlib
 import logging
+import signal
 import time
 import os
 import sys
@@ -562,6 +564,93 @@ def train_worker(cfg_container: dict, seed: int, worker_index: int, combo: str, 
     setup_and_train_qcbm(cfg, combo=combo, output_dir=output_dir)
 
 
+def _sigterm_as_interrupt():
+    """Make SIGTERM raise KeyboardInterrupt; returns the previous handler (for _restore_sigterm).
+
+    Python's default SIGTERM disposition kills the process outright: no exception, no `finally`, so a
+    `scancel`ed or user-killed run would lose everything it had trained -- nothing saved to disk, no
+    artifact. Turning it into an exception routes termination through the same unwinding path as a
+    crash or Ctrl-C, which is what lets _finalize_run below still checkpoint and upload.
+
+    SIGINT is left alone (Python already raises KeyboardInterrupt for it). SIGKILL cannot be caught
+    by anyone, so a `kill -9` (or SLURM's post-KillWait kill) still loses the run -- which is why the
+    interrupted path skips the artifact stagger: whatever grace period we have may be seconds long.
+
+    signal.signal only works in a process's main thread; a worker calling this from elsewhere gets a
+    ValueError, which is swallowed (the run then behaves as it did before this existed).
+    """
+    def _handler(signum, frame):
+        raise KeyboardInterrupt(f"terminated by signal {signum}")
+
+    try:
+        return signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError, AttributeError) as exc:
+        logging.getLogger("QCBM").debug(f"[finalize] no SIGTERM handler installed: {exc!r}")
+        return None
+
+
+def _restore_sigterm(previous) -> None:
+    """Undo _sigterm_as_interrupt (a pool worker outlives one run and must not keep the handler)."""
+    if previous is None:
+        return
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _finalize_run(cfg, qcbm, save_dir: str, wandb_run, combo: str, status: str) -> None:
+    """Write the checkpoints and push the model artifact. Runs on EVERY exit path; never raises.
+
+    `status` is "completed", "crashed" or "interrupted" -- the last two mean training stopped early,
+    so the checkpoints hold whatever the run had reached (best_params is the best model seen so far;
+    checkpoint_meta.json's final_iter says how far it actually got). It is recorded both in the run
+    summary and in the artifact metadata so an early-stopped model is never mistaken for a full one.
+
+    Errors here are logged and swallowed: this is called from a `finally`, and raising would mask the
+    exception that stopped training in the first place.
+    """
+    logger = logging.getLogger("QCBM")
+    if qcbm is None or not save_dir:
+        return                                     # died before there was a model to save
+
+    try:
+        qcbm.save(save_dir)
+    except Exception as exc:
+        logger.error(f"[finalize] could not save model to {save_dir}: {exc!r}")
+        return                                     # nothing on disk -> nothing to upload
+
+    # Record the best-model summary for the selection step, plus the local save_dir as the
+    # fallback source for checkpoints if the artifact upload below is refused
+    # (benchmark.load_checkpoint uses it). One batched update, not several server round-trips.
+    wandb_run.summary({"best_mmd_val": qcbm.best_metric,
+                       "best_iter": qcbm.best_iter,
+                       "total_measurements": qcbm.total_measurements,
+                       "iterations_run": qcbm.iterations_run,
+                       "measurements_per_step": qcbm.measurements_per_step,
+                       # iterations_run is the PLANNED length (fixed when SGD starts, budget-derived);
+                       # final_iter is how far this run actually got, which differs when it died early
+                       "final_iter": len(qcbm.parameter_hist) - 1,
+                       "run_status": status,
+                       "save_dir": os.path.abspath(save_dir)})
+
+    # Model artifact -- the heaviest per-run burst of API calls in a sweep (create + per-file
+    # upload + commit), and runs doing identical work all reach it at the same time, so it is
+    # staggered like init and skippable entirely (logging.wandb_log_artifacts); the same files
+    # stay on disk in save_dir either way, which benchmark.load_checkpoint falls back to.
+    if not (cfg.logging.wandb_log_artifacts and wandb_run.run_id is not None):
+        return
+    if status == "completed":
+        wandb_logging.stagger(cfg, cfg.sweep.random_seed, "artifact")   # see docstring: not when dying
+    files = [p for p in (f"{save_dir}/circuit.qpy", f"{save_dir}/best_params.npy",
+                         f"{save_dir}/final_params.npy") if os.path.exists(p)]
+    aliases = [f"seed{cfg.sweep.random_seed}"] + ([] if status == "completed" else [status])
+    wandb_run.log_artifact(
+        f"qcbm_{wandb_run.run_id}",
+        files,
+        metadata={"seed": cfg.sweep.random_seed, "combo": combo, "status": status,
+                  "best_iter": qcbm.best_iter, "final_iter": len(qcbm.parameter_hist) - 1},
+        aliases=aliases)
+
+
 def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str = "."):
     """Train one QCBM for a single (already-seeded) config; one wandb run per call.
 
@@ -586,6 +675,13 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
     # errors -- so neither a 429 at init nor one mid-training can take the training run down.
     run = wandb_logging.init_run(cfg, sweep_id, cfg.sweep.random_seed)
     wandb_run = wandb_logging.logger_for(cfg, run, label=f"seed{cfg.sweep.random_seed}")
+
+    # Set as soon as they exist so the finalizer in the `finally` below can checkpoint + upload
+    # whatever training reached, on any exit path (see _finalize_run / _sigterm_as_interrupt).
+    qcbm = None
+    save_dir = ""
+    status = "completed"
+    previous_sigterm = _sigterm_as_interrupt()
 
     try:
         # Setup dataloader and 3-way split (computed once, reused for MPS + QCBM)
@@ -637,33 +733,30 @@ def setup_and_train_qcbm(cfg: DictConfig, combo: str = "single", output_dir: str
             baseline_circuit=linear_circuit, baseline_params=linear_params,
             baseline_seed=cfg.sweep.initial_random_seed)
 
-        # Save model + checkpoint
-        qcbm.save(save_dir)
-
-        # Record the best-model summary for the selection step, plus the local save_dir as the
-        # fallback source for checkpoints if the artifact upload below is refused
-        # (benchmark.load_checkpoint uses it). One batched update, not three server round-trips.
-        wandb_run.summary({"best_mmd_val": qcbm.best_metric,
-                           "best_iter": qcbm.best_iter,
-                           "total_measurements": qcbm.total_measurements,
-                           "iterations_run": qcbm.iterations_run,
-                           "measurements_per_step": qcbm.measurements_per_step,
-                           "save_dir": os.path.abspath(save_dir)})
-
-        # Model artifact -- the heaviest per-run burst of API calls in a sweep (create + per-file
-        # upload + commit), and runs doing identical work all reach it at the same time, so it is
-        # staggered like init and skippable entirely (logging.wandb_log_artifacts); the same files
-        # stay on disk in save_dir either way, which benchmark.load_checkpoint falls back to.
-        if cfg.logging.wandb_log_artifacts and wandb_run.run_id is not None:
-            wandb_logging.stagger(cfg, cfg.sweep.random_seed, "artifact")
-            wandb_run.log_artifact(
-                f"qcbm_{wandb_run.run_id}",
-                [f"{save_dir}/circuit.qpy", f"{save_dir}/best_params.npy",
-                 f"{save_dir}/final_params.npy"],
-                metadata={"seed": cfg.sweep.random_seed, "combo": combo},
-                aliases=[f"seed{cfg.sweep.random_seed}"])
-
         logger.info("Program finished")
         logger.info(f"Program execution time: {round((time.time() - start_time) / 60, 2)} minutes")
+    except (KeyboardInterrupt, SystemExit) as exc:
+        # Ctrl-C, `scancel`, or any other SIGTERM (see _sigterm_as_interrupt). Re-raised so the
+        # process still dies -- but only after the finalizer below has checkpointed and uploaded.
+        status = "interrupted"
+        logger.warning(f"Run interrupted ({exc!r}) after "
+                       f"{round((time.time() - start_time) / 60, 2)} minutes -- saving and uploading "
+                       f"the model trained so far before exiting.")
+        raise
+    except Exception:
+        status = "crashed"
+        logger.exception("Run crashed -- saving and uploading the model trained so far.")
+        raise
     finally:
-        wandb_run.finish()  # final flush of buffered rows, then close the run
+        # Save + summary + artifact happen HERE, not on the success path, so a run that crashes or is
+        # killed mid-training still leaves a loadable checkpoint on disk and in wandb. SIGTERM is
+        # IGNORED for the duration: a second `scancel` (the natural reaction to a job that doesn't
+        # die instantly) would otherwise kill the process exactly during the upload it is waiting
+        # for. Ctrl-C/SIGINT is deliberately left working as the escape hatch from a stuck upload.
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            _finalize_run(cfg, qcbm, save_dir, wandb_run, combo, status)
+            wandb_run.finish()  # final flush of buffered rows, then close the run
+        finally:
+            _restore_sigterm(previous_sigterm)
