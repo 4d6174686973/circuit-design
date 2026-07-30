@@ -43,6 +43,18 @@ def resolve_iterations(mode: str, iterations: int, measurement_budget: float,
     return int(measurement_budget // measurements_per_step)
 
 
+# The MMD targets tracked on every eval step: the three splits individually, plus the unions of
+# them. Fixed order, so losses.parquet always carries the same columns and the wandb keys
+# (train/<name>) are stable across runs. A split that is empty for a given config (e.g. no val
+# split) yields NaN rather than a missing column.
+MMD_KEYS = ("mmd_train", "mmd_val", "mmd_test",
+            "mmd_train_val", "mmd_train_test", "mmd_train_val_test")
+
+# Model selection may only use targets that do NOT contain the test split -- selecting on anything
+# test-derived would leak the held-out data into the choice of checkpoint.
+MMD_SELECTABLE = ("mmd_train", "mmd_val", "mmd_train_val")
+
+
 class QCBM:
     def __init__(
             self,
@@ -69,10 +81,11 @@ class QCBM:
         # training state and results
         self.weight_grad: np.ndarray = np.zeros(self.circuit.num_parameters)
         self.parameter_hist: list[np.ndarray] = [self.parameters]
-        self.losses: dict[str, list] = {"mmd_train": [], "mmd_val": []}  # test tracking is test_bench_hist below
-        # per-eval-step held-out test benchmark suite (bench_dist + bench_val + BAS-only bench_BAS),
-        # variable-key dicts dumped to test_metrics.parquet in save(); also logged to wandb inline.
-        self.test_bench_hist: list[dict] = []
+        self.losses: dict[str, list] = {k: [] for k in MMD_KEYS}  # per-eval-step MMD, see MMD_KEYS
+        # per-eval-step benchmark suite against the FULL dataset (bench_dist + bench_val + BAS-only
+        # bench_BAS), variable-key dicts dumped to bench_metrics.parquet in save(); also logged to
+        # wandb inline.
+        self.bench_hist: list[dict] = []
 
         # best checkpoint (model selection); populated during training
         self.best_params: np.ndarray = self.parameters.copy()
@@ -177,13 +190,27 @@ class QCBM:
         self._last_wandb_s = wandb_run.log(payload, step=step) or 0.0
         return self._last_wandb_s
 
+    @staticmethod
+    def _mmd_per_target(mmd_targets: dict, S, S_probs, sigmas: np.ndarray) -> dict:
+        """MMD of one sample set against every pre-extracted target: {name: value} over MMD_KEYS.
+
+        A target that doesn't exist for this config (an empty val/test split, and the partial unions
+        that would then duplicate another column -- see stochastic_gradient_descent) is NaN rather
+        than absent, so losses.parquet and the wandb keys keep a fixed set of columns.
+        """
+        out = {}
+        for name in MMD_KEYS:
+            target = mmd_targets.get(name)
+            out[name] = (cost_mmd_pre(target[0], target[1], S, S_probs, sigmas)
+                         if target is not None else np.nan)
+        return out
+
     def _log_baseline_step(self, baseline_circuit, baseline_params, baseline_seed, N_shots: int,
-                           T_train, T_train_probs, T_val, T_val_probs, sigmas: np.ndarray,
-                           dataset_kind: str, valid_patterns, X_train_count: dict,
-                           X_test_count: dict, wandb_run, logger) -> None:
+                           mmd_targets: dict, sigmas: np.ndarray, dataset_kind: str, valid_patterns,
+                           X_train_count: dict, X_full_count: dict, wandb_run, logger) -> None:
         """Sample the shared LINEAR, UNEXTENDED circuit and log it as step 0 (see the
         baseline_circuit/baseline_params docstring on stochastic_gradient_descent). Mutates
-        self.losses/self.test_bench_hist like a training-iteration eval step, but is not a
+        self.losses/self.bench_hist like a training-iteration eval step, but is not a
         selectable checkpoint.
 
         Sampled with a FIXED seed (baseline_seed, the sweep's global initial_random_seed) rather
@@ -195,26 +222,25 @@ class QCBM:
                                seed_simulator=baseline_seed)
         sample_time = time.time()
         B, B_probs = sample_info(B_counts)
-        b_train = cost_mmd_pre(T_train, T_train_probs, B, B_probs, sigmas)
-        b_val = cost_mmd_pre(T_val, T_val_probs, B, B_probs, sigmas) if T_val is not None else np.nan
+        b_mmds = self._mmd_per_target(mmd_targets, B, B_probs, sigmas)
         b_bench = {}
-        if len(X_test_count):
-            b_bench = evaluate(B_counts, {"test": X_test_count}, dataset_kind, sigmas=sigmas,
+        if len(X_full_count):
+            b_bench = evaluate(B_counts, X_full_count, dataset_kind, sigmas=sigmas,
                                valid_patterns=valid_patterns, train_patterns=X_train_count)
-            self.test_bench_hist.append({"iteration": 0, **b_bench})
-        self.losses["mmd_train"].append(b_train)
-        self.losses["mmd_val"].append(b_val)
+            self.bench_hist.append({"iteration": 0, **b_bench})
+        for name, value in b_mmds.items():
+            self.losses[name].append(value)
         eval_time = time.time()
-        logger.debug(f"| Step 0 baseline (linear, unextended) | Train MMD = {np.round(b_train, 6)} "
-                    f"| Val MMD = {np.round(b_val, 6)}")
+        logger.debug(f"| Step 0 baseline (linear, unextended) | "
+                    f"Train MMD = {np.round(b_mmds['mmd_train'], 6)} "
+                    f"| Val MMD = {np.round(b_mmds['mmd_val'], 6)}")
         if wandb_run is not None:
             log0 = {"train/step": 0, "train/cumulative_measurements": 0,
                     "train/measurements_per_step": 0, "train/num_parameters": self.circuit.num_parameters,
-                    "train/mmd_train": b_train, "train/mmd_val": b_val,
-                    "train/mmd_test": b_bench.get("bench_dist/test/mmd", np.nan),
                     "time/sampling_s": sample_time - start_time, "time/gradient_s": 0.0,
                     "time/eval_s": eval_time - sample_time,
                     "time/total_s": eval_time - start_time}
+            log0.update({f"train/{name}": value for name, value in b_mmds.items()})
             log0.update(b_bench)
             self._log_step(wandb_run, log0, step=0)
 
@@ -230,14 +256,14 @@ class QCBM:
 
         Splits are supplied pre-computed by the caller; validation MMD drives model selection.
 
-        On every eval step the full benchmark suite (src.benchmark.evaluate: bench_dist/test/{mmd,
-        kl,tv,fidelity}, Gili et al. bench_val/* generalization metrics, and -- BAS only --
+        On every eval step the full benchmark suite (src.benchmark.evaluate: bench_dist/{mmd,kl,tv,
+        fidelity,nll}, Gili et al. bench_val/* generalization metrics, and -- BAS only --
         bench_BAS/{precision,recall,qbas}, scoped by valid_patterns; None for JGB, where bench_val/*
-        treats every bitstring as valid) is computed on the TEST split and logged to wandb, tracking
-        the held-out test trajectory rather than just its final value. `train/mmd_test` mirrors
-        bench_dist/test/mmd under the "train" tab alongside train/mmd_{train,val} for one
-        at-a-glance curve. All of this is skipped when the test split is empty (e.g.
-        val_size + train_size == 1).
+        treats every bitstring as valid) is computed against the FULL dataset -- train, val and test
+        merged into one target -- and logged to wandb, tracking the trajectory rather than just the
+        final value. Split-resolved MMD lives under the "train" tab instead: train/mmd_{train,val,
+        test} for the individual splits and train/mmd_{train_val,train_test,train_val_test} for
+        their unions (see MMD_KEYS), all against the same kernel/sigmas as the loss.
 
         baseline_circuit/baseline_params/baseline_seed (REQUIRED, keyword-only): the shared LINEAR,
         UNEXTENDED circuit/params/seed (the sweep's fixed initial_random_seed), evaluated with the
@@ -258,9 +284,13 @@ class QCBM:
         """
 
         logger = logging.getLogger('QCBM')
+        if model_selection_metric not in MMD_SELECTABLE:
+            raise ValueError(f"qcbm.model_selection_metric must be one of {MMD_SELECTABLE}, got "
+                             f"{model_selection_metric!r} (test-derived metrics would leak the "
+                             f"held-out split into model selection)")
         self.model_selection_metric = model_selection_metric
         sigmas = np.array(sigmas)
-        from src.benchmark import evaluate  # avoids import-time cycle with setup
+        from src.benchmark import evaluate, merge_counts  # avoids import-time cycle with setup
 
         # Parameters
         if loss_func == 'KL':
@@ -274,10 +304,25 @@ class QCBM:
         self.weight_grad = np.zeros(self.circuit.num_parameters)
         [m, v] = [np.zeros(self.circuit.num_parameters) for _ in range(2)]  # adam variables
 
-        # pre-extract held-out targets once; the test split is evaluated via benchmark.evaluate()
-        # below instead (bench_dist/test/mmd uses the same kernel/sigmas).
-        T_train, T_train_probs = sample_info(X_train_count)
-        T_val, T_val_probs = sample_info(X_val_count) if len(X_val_count) else (None, None)
+        # Pre-extract every MMD target once (arrays + probabilities are reused for all iterations):
+        # the three splits and the unions of them, see MMD_KEYS. Empty splits are dropped here and
+        # reported as NaN by _mmd_per_target. The full union is also the single target the
+        # bench_dist/* suite scores against (benchmark.evaluate below).
+        X_full_count = merge_counts(X_train_count, X_val_count, X_test_count)
+        target_counts = {"mmd_train": X_train_count,
+                         "mmd_val": X_val_count,
+                         "mmd_test": X_test_count,
+                         "mmd_train_val": merge_counts(X_train_count, X_val_count),
+                         "mmd_train_test": merge_counts(X_train_count, X_test_count),
+                         "mmd_train_val_test": X_full_count}
+        # a PARTIAL union is only meaningful when the split it adds is non-empty (train+val on an
+        # empty val split is just train, and logging it as such would silently duplicate the train
+        # curve). mmd_train_val_test is exempt: it is "the whole dataset", whatever splits that
+        # consists of, so it always mirrors bench_dist/mmd.
+        needs = {"mmd_train_val": (X_val_count,), "mmd_train_test": (X_test_count,)}
+        mmd_targets = {name: sample_info(counts) for name, counts in target_counts.items()
+                       if len(counts) and all(len(c) for c in needs.get(name, ()))}
+        T_train, T_train_probs = mmd_targets["mmd_train"]
 
         measurements_per_step = (2 * self.circuit.num_parameters + 1) * N_shots
 
@@ -312,9 +357,8 @@ class QCBM:
         # Step 0 is always the shared LINEAR, UNEXTENDED circuit; training iterations are logged at
         # steps 1..iterations. Not a selectable checkpoint, so excluded from model selection.
         self._log_baseline_step(
-            baseline_circuit, baseline_params, baseline_seed, N_shots, T_train, T_train_probs,
-            T_val, T_val_probs, sigmas, dataset_kind, valid_patterns, X_train_count, X_test_count,
-            wandb_run, logger)
+            baseline_circuit, baseline_params, baseline_seed, N_shots, mmd_targets, sigmas,
+            dataset_kind, valid_patterns, X_train_count, X_full_count, wandb_run, logger)
 
         # Training loop
         for it in range(iterations):
@@ -362,26 +406,25 @@ class QCBM:
 
             # Evaluate held-out losses (every eval_every iterations and on the final iteration)
             do_eval = (it % eval_every == 0) or (it == iterations - 1)
-            test_bench = {}
+            bench = {}
             if do_eval:
-                mmd_train = cost_mmd_pre(T_train, T_train_probs, S, S_probs, sigmas)
-                mmd_val = cost_mmd_pre(T_val, T_val_probs, S, S_probs, sigmas) if T_val is not None else np.nan
-                if len(X_test_count):
-                    test_bench = evaluate(S_counts, {"test": X_test_count}, dataset_kind,
-                                          sigmas=sigmas, valid_patterns=valid_patterns,
-                                          train_patterns=X_train_count)
-                    self.test_bench_hist.append({"iteration": step, **test_bench})
+                mmds = self._mmd_per_target(mmd_targets, S, S_probs, sigmas)
+                if len(X_full_count):
+                    bench = evaluate(S_counts, X_full_count, dataset_kind,
+                                     sigmas=sigmas, valid_patterns=valid_patterns,
+                                     train_patterns=X_train_count)
+                    self.bench_hist.append({"iteration": step, **bench})
             else:
-                mmd_train = mmd_val = np.nan
-            self.losses["mmd_train"].append(mmd_train)
-            self.losses["mmd_val"].append(mmd_val)
+                mmds = {name: np.nan for name in MMD_KEYS}
+            for name, value in mmds.items():
+                self.losses[name].append(value)
             eval_time = time.time()
 
             # Keep the checkpoint (pre-update params) with the best metric. Test-set metrics are
             # deliberately NOT selectable -- using the held-out test split would leak it into
             # selection. best_iter indexes the same step where this checkpoint's metrics appear.
             if do_eval:
-                sel = {"mmd_train": mmd_train, "mmd_val": mmd_val}[model_selection_metric]
+                sel = mmds[model_selection_metric]
                 if np.isfinite(sel) and sel < self.best_metric:
                     self.best_metric = float(sel)
                     self.best_iter = step
@@ -404,17 +447,18 @@ class QCBM:
                     "time/total_s": total_s,
                 }
                 if do_eval:
-                    log.update({"train/mmd_train": mmd_train, "train/mmd_val": mmd_val,
-                               "train/mmd_test": test_bench.get("bench_dist/test/mmd", np.nan)})
-                    log.update(test_bench)
+                    log.update({f"train/{name}": value for name, value in mmds.items()})
+                    log.update(bench)
                 logging_s = self._log_step(wandb_run, log, step)
             else:
                 logging_s = 0.0
 
             # Final logging
             logger.debug(f"| Total = {np.round(total_s, 2)} s | Sampling = {np.round(sample_time - start_time, 2)} s | Gradient = {np.round(grad_time - sample_time, 2)} s | Eval = {np.round(eval_time - grad_time, 2)} s | Logging = {np.round(logging_s, 2)} s")
-            test_mmd_str = f"{test_bench['bench_dist/test/mmd']:.6f}" if "bench_dist/test/mmd" in test_bench else "n/a"
-            logger.debug(f"| MMD loss | Train = {np.round(mmd_train, 6)} | Val = {np.round(mmd_val, 6)} | Test = {test_mmd_str}")
+            logger.debug(f"| MMD loss | Train = {np.round(mmds['mmd_train'], 6)} "
+                        f"| Val = {np.round(mmds['mmd_val'], 6)} "
+                        f"| Test = {np.round(mmds['mmd_test'], 6)} "
+                        f"| Full = {np.round(mmds['mmd_train_val_test'], 6)}")
 
         # Push whatever is still buffered before the caller moves on to saving/artifact upload, so a
         # partially-filled last chunk isn't held until run.finish().
@@ -429,8 +473,8 @@ class QCBM:
         losses_df = pd.DataFrame(self.losses)
         losses_df.to_parquet(f"{save_dir}/losses.parquet")
 
-        if self.test_bench_hist:
-            pd.DataFrame(self.test_bench_hist).to_parquet(f"{save_dir}/test_metrics.parquet")
+        if self.bench_hist:
+            pd.DataFrame(self.bench_hist).to_parquet(f"{save_dir}/bench_metrics.parquet")
 
         np.save(f"{save_dir}/params.npy", np.array(self.parameter_hist, dtype=object), allow_pickle=True)
 

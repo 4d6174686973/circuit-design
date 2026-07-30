@@ -34,7 +34,7 @@ from src.extension import (linear_topology, nearest_neighbor_topology, all_to_al
                            connection_threshold_curve, select_threshold, knee_threshold,
                            percolation_threshold)
 from src.utils import mutual_info_matrix, feature_distance_matrix, get_features_for_quasi_dist, array_to_str
-from src.data import BAS, JGB, DataLoader
+from src.data import BAS, JGB, DataLoader, init_qubit_order_bas
 from src.setup import setup_dataloader, compute_split
 from src.plotting import _save, use_science_style, OKABE_ITO, SEQUENTIAL_CMAP, categorical_colors
 
@@ -43,6 +43,7 @@ _METRIC_LABELS = {"hamming": "Hamming distance", "varinfo": "Variation of Inform
 # shared train/val/test color coding for the BAS-image and JGB-raw-data split figures
 _SPLIT_ORDER = ["train", "val", "test"]
 _SPLIT_BASE_COLORS = {"train": OKABE_ITO["blue"], "val": OKABE_ITO["orange"], "test": OKABE_ITO["bluish_green"]}
+_SPLIT_LABELS = {"train": "Train", "val": "Validation", "test": "Test"}
 
 
 def _split_color(label: str) -> str:
@@ -127,9 +128,13 @@ def plot_bas_images(width=3, height=3, train_split=0.5, val_split=0.25, seed=Non
     n = len(imgs)
 
     # wrap into a roughly square grid instead of one long row -- a single row stays readable for a
-    # handful of patterns but keeps stretching the figure wider as the enumerated support grows
-    ncols = int(np.ceil(np.sqrt(n)))
-    nrows = int(np.ceil(n / ncols))
+    # handful of patterns but keeps stretching the figure wider as the enumerated support grows.
+    # BAS 3x3 has few enough patterns (n=6) that a single row is still readable, so keep it flat.
+    if width == 3 and height == 3:
+        ncols, nrows = n, 1
+    else:
+        ncols = int(np.ceil(np.sqrt(n)))
+        nrows = int(np.ceil(n / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 1.2, nrows * 1.2))
     for i, ax in enumerate(np.atleast_1d(axes).ravel()):
         if i >= n:
@@ -141,10 +146,11 @@ def plot_bas_images(width=3, height=3, train_split=0.5, val_split=0.25, seed=Non
             spine.set_visible(True); spine.set_color(color); spine.set_linewidth(2)
         ax.set_xticks([]); ax.set_yticks([])
     handles = [Patch(facecolor="none", edgecolor=_split_color(l), linewidth=2,
-                    label=f"{l} ({100 * label_counts[l] / n:.0f}%)")
+                    label=f"{' + '.join(_SPLIT_LABELS.get(s, s) for s in l.split('+'))} "
+                          f"({100 * label_counts[l] / n:.0f}%)")
               for l in sorted(set(labels), key=_split_sort_key)]
-    fig.legend(handles=handles, loc="upper center", ncol=len(handles), fontsize=12,
-              bbox_to_anchor=(0.5, 1.0 + 0.3 / nrows), frameon=False)
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles), fontsize=18,
+              bbox_to_anchor=(0.5, 1.0 + 0.4 / nrows), frameon=False)
     plt.tight_layout()
     if save:
         _save(fig, plots_dir, "BAS_images")
@@ -289,6 +295,10 @@ SU4_PARAMS_PER_EDGE = 15
 
 
 def _draw_topology(ax, n_qubits, edges_base, edges_ext, title):
+    # nodes sit around the circle in index order (0, 1, ... n-1) in every panel, so a node's place on
+    # the page is fixed and only the edges differ between panels -- for BAS 3x3 that means the MPS
+    # chain's permuted hops (2-5, 5-4, 4-3, 3-6) are visible as chords rather than hidden by moving
+    # the nodes to make the chain a neat ring.
     edges_new = sorted(set(edges_ext) - set(edges_base))
     G = nx.Graph(); G.add_nodes_from(range(n_qubits))
     G.add_edges_from(edges_base); G.add_edges_from(edges_ext)
@@ -302,22 +312,61 @@ def _draw_topology(ax, n_qubits, edges_base, edges_ext, title):
     ax.set_xticks([]); ax.set_yticks([])
 
 
+def _node_labels(cfg) -> list:
+    """The index labels these panels draw, as a qubit -> label map.
+
+    PLOTTING ONLY -- nothing here feeds a circuit; the simulation's qubit indices and connections are
+    untouched. The labels are the dataset's own feature indices (for BAS: grid-pixel positions), which
+    is what a reader of these figures interprets the node numbers as, and what
+    nearest_neighbor_topology's grid adjacency is defined over. The circuit runs on qubits that
+    DataLoader.reorder_features has permuted those features onto -- qubit k carries feature
+    init_qubit_order_bas[k] -- so the map below is exactly that permutation, and identity for every
+    config reorder_features leaves alone (JGB, and BAS grids with no entry).
+    """
+    if cfg.data.dataset == "BAS":
+        return list(init_qubit_order_bas.get(f"{cfg.data.width}x{cfg.data.height}",
+                                             range(cfg.data.N_qubits)))
+    return list(range(cfg.data.N_qubits))
+
+
+def _to_labels(connections: list, labels: list) -> list:
+    """Rewrite qubit-indexed connections onto the panels' node labels (see _node_labels)."""
+    return sorted(set(tuple(sorted((int(labels[i]), int(labels[j])))) for i, j in connections))
+
+
 def plot_topology_panel(cfg, X_train: np.ndarray, distmat: np.ndarray, threshold: float,
                         rule: str = "knee", plots_dir: str = "plots", save: bool = True):
-    """Topology networks over the same qubit indices the trained circuit actually uses (X_train is
-    the reordered split from compute_split, so linear/metric-based/chow-liu edges here are directly
-    comparable to setup.setup_circuit_extensions' init_connections/extension_connections)."""
+    """Topology networks for every extension method, drawn on the dataset's own feature indices
+    (BAS: grid-pixel positions -- see _node_labels), showing exactly the graphs
+    setup.setup_circuit_extensions builds.
+
+    The MPS chain is setup's linear_topology(range(N_qubits)) over data reorder_features has already
+    permuted, so on these labels it is the snake path 0-1-2-5-4-3-6-7-8 for BAS 3x3, not 0-...-8: the
+    same physical circuit, read on the grid. EVERY extension graph is relabelled the same way, by
+    _to_labels -- whatever setup hands to extend_circuit is a list of QUBIT pairs, including
+    nearest_neighbor_topology's, whose grid-index pairs setup consumes as qubit indices without
+    permuting them. Relabelling chain and extension together is a bijection, so each panel's NEW-edge
+    count is exactly the "New connections" its run logs: 6 nearest-neighbor / 4 metric-based /
+    5 Chow-Liu / 28 all-to-all for BAS 3x3 (verified against runs clsxmzpk and gqr78zjr, whose
+    Num Params differ by 30 = 2 extra SU(4) gates).
+
+    So panel b honestly shows the nearest-neighbor circuit that is actually built -- and it is NOT
+    grid adjacency: 2 of its 6 added edges, (2,3) and (5,6), join grid pixels that aren't neighbours,
+    because setup's nearest_neighbor branch never maps its pixel pairs through init_qubit_order_bas.
+    Making that panel look like a grid requires fixing setup.setup_circuit_extensions, not this
+    figure."""
     dataset = cfg.data.dataset
     n_qubits = cfg.data.N_qubits
-    edges_lin = linear_topology(list(range(n_qubits)))
-    edges_metric = metric_based_topology(distmat, threshold)
-    edges_tree = chow_liu_topology(mutual_info_matrix(np.asarray(X_train)))
+    labels = _node_labels(cfg)
+    edges_lin = linear_topology(labels)
+    edges_metric = _to_labels(metric_based_topology(distmat, threshold), labels)
+    edges_tree = _to_labels(chow_liu_topology(mutual_info_matrix(np.asarray(X_train))), labels)
 
     if dataset == "BAS":
         width, height = cfg.data.width, cfg.data.height
         panels = {
             "a) Linear": edges_lin,
-            "b) Nearest-Neighbor": nearest_neighbor_topology(width, height),
+            "b) Nearest-Neighbor": _to_labels(nearest_neighbor_topology(width, height), labels),
             f"c) Metric-Based ({rule}={threshold:.2f})": edges_metric,
             "d) Chow-Liu": edges_tree,
             "e) All-to-All": all_to_all_topology(n_qubits),

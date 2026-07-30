@@ -2,7 +2,10 @@
 
 Pure, read-only metric functions plus classical baselines and a wandb-driven best-model selection
 step. Metrics consume the {bitstring: count} dictionary format used throughout the codebase and
-reuse helpers from src.utils / src.cost so the held-out MMD matches the training kernel exactly.
+reuse helpers from src.utils / src.cost so the benchmark MMD matches the training kernel exactly.
+
+The distribution-distance metrics (bench_dist/*) score the model against the FULL dataset -- train,
+val and test merged into one target -- rather than per split; see evaluate.
 """
 
 import os
@@ -25,6 +28,23 @@ def to_prob_dict(counts: dict) -> dict:
     """Normalize a {bitstring: count} dict into {bitstring: probability}."""
     total = sum(counts.values())
     return {k: v / total for k, v in counts.items()}
+
+
+def merge_counts(*count_dicts) -> dict:
+    """Sum several {bitstring: count} dicts into one (the union of the splits).
+
+    Used to build the FULL-dataset target the distribution-distance metrics are computed against
+    (train + val + test together, see evaluate). Note for BAS `full_support`, where every split is
+    the complete enumerated pattern set: merging multiplies every count by the number of splits,
+    which leaves the normalized target distribution -- and hence every metric -- unchanged.
+    """
+    merged = {}
+    for counts in count_dicts:
+        if not counts:
+            continue
+        for bitstring, c in counts.items():
+            merged[bitstring] = merged.get(bitstring, 0) + c
+    return merged
 
 
 def weighted_quantile(values: np.ndarray, probs: np.ndarray, q: np.ndarray) -> np.ndarray:
@@ -68,10 +88,19 @@ def classical_fidelity(samples: dict, target: dict) -> float:
     return float(sum(np.sqrt(P.get(k, 0.0) * Q.get(k, 0.0)) for k in keys) ** 2)
 
 
-def negative_log_likelihood(samples: dict, target_samples: np.ndarray, eps: float = 1e-8) -> float:
-    """Mean NLL of held-out data points under the model distribution."""
+def negative_log_likelihood(samples: dict, target, eps: float = 1e-8) -> float:
+    """Mean NLL of the target data points under the model distribution.
+
+    `target` is either a {bitstring: count} dict -- each bitstring weighted by its count, so the
+    result equals the mean over the underlying data points -- or a 2-D binary sample array.
+    """
     Q = to_prob_dict(samples)
-    bitstrings = array_to_str(target_samples)
+    if isinstance(target, dict):
+        total = sum(target.values())
+        if total == 0:
+            return float("nan")
+        return float(sum(c * -np.log(max(eps, Q.get(b, 0.0))) for b, c in target.items()) / total)
+    bitstrings = array_to_str(target)
     return float(np.mean([-np.log(max(eps, Q.get(b, 0.0))) for b in bitstrings]))
 
 
@@ -309,13 +338,20 @@ def gaussian_baseline_jgb(decimal_train: np.ndarray, bits_per_feature: int, n_fe
 # --------------------------------------------------------------------------------------------------
 # top-level evaluation
 # --------------------------------------------------------------------------------------------------
-def evaluate(samples: dict, splits: dict, dataset_kind: str, sigmas=np.array([1.0]),
+def evaluate(samples: dict, target: dict, dataset_kind: str, sigmas=np.array([1.0]),
              valid_patterns: np.ndarray = None, train_patterns=None) -> dict:
-    """Run the appropriate metric bundle over each named split and return a flat metric dict.
+    """Run the appropriate metric bundle against one target distribution; flat metric dict.
+
+    The distribution distances are deliberately computed against the FULL dataset (train + val +
+    test merged, see merge_counts) rather than per split: they measure how well the model reproduces
+    the data distribution, and the splits are three finite samples of the SAME distribution, so
+    per-split distances mostly differ by their sample size. Split-resolved MMD stays available on
+    the training side as train/mmd_{train,val,test,train_val,train_test,train_val_test} (see
+    QCBM.stochastic_gradient_descent).
 
     Args:
         samples: model sample counts {bitstring: count}
-        splits: {split_name: target_count_dict}, e.g. {"val": ..., "test": ...}
+        target: FULL-dataset target counts {bitstring: count}
         dataset_kind: "BAS" or "JGB"
         valid_patterns: enumerated valid BAS patterns (BAS only -- used by both bench_val and
             bench_BAS below); None for JGB, where bench_val instead treats every bitstring as
@@ -324,17 +360,16 @@ def evaluate(samples: dict, splits: dict, dataset_kind: str, sigmas=np.array([1.
             Gili et al. bench_val/* generalization metrics are computed for BOTH dataset kinds
             (BAS against the enumerated valid space, JGB against the full bitstring hypercube).
 
-    Returns bench_dist/<split>/{mmd,kl,tv,fidelity} for every non-empty split, bench_val/* (all
+    Returns bench_dist/{mmd,kl,tv,fidelity,nll} (whenever the target is non-empty), bench_val/* (all
     datasets, whenever train_patterns is given), and -- BAS only -- bench_BAS/{precision,recall,qbas}.
     """
     metrics = {}
-    for name, target in splits.items():
-        if not target:
-            continue
-        metrics[f"bench_dist/{name}/mmd"] = mmd(samples, target, sigmas)
-        metrics[f"bench_dist/{name}/kl"] = kl_divergence(samples, target)
-        metrics[f"bench_dist/{name}/tv"] = total_variation_distance(samples, target)
-        metrics[f"bench_dist/{name}/fidelity"] = classical_fidelity(samples, target)
+    if target:
+        metrics["bench_dist/mmd"] = mmd(samples, target, sigmas)
+        metrics["bench_dist/kl"] = kl_divergence(samples, target)
+        metrics["bench_dist/tv"] = total_variation_distance(samples, target)
+        metrics["bench_dist/fidelity"] = classical_fidelity(samples, target)
+        metrics["bench_dist/nll"] = negative_log_likelihood(samples, target)
     if train_patterns is not None:
         metrics.update(generalization_metrics(samples, train_patterns, valid_patterns))
     if dataset_kind == "BAS" and valid_patterns is not None:
@@ -472,12 +507,13 @@ def sample_model(circuit, params: np.ndarray, n_shots: int, seed: int = 0) -> di
     return counts if isinstance(counts, dict) else counts[0]
 
 
-def _test_split_for_config(cfg) -> tuple:
-    """Reconstruct the held-out targets + dataset context from a run's config.
+def _full_target_for_config(cfg) -> tuple:
+    """Reconstruct the full-dataset target + dataset context from a run's config.
 
-    Returns (splits, valid_patterns, train_counts): the val/test target dicts used for the
-    distribution-distance metrics, the enumerated valid patterns (BAS only, else None), and the
-    training-split counts (used for the generalization metrics' seen-set).
+    Returns (full_counts, valid_patterns, train_counts): the train+val+test counts merged into the
+    single target the distribution-distance metrics are computed against (see evaluate), the
+    enumerated valid patterns (BAS only, else None), and the training-split counts on their own
+    (used for the generalization metrics' seen-set).
     """
     from src.data import BAS, JGB, DataLoader
     if cfg.data.dataset == "BAS":
@@ -486,13 +522,14 @@ def _test_split_for_config(cfg) -> tuple:
         dataset = JGB(cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer)
     dl = DataLoader(dataset)
     # Reconstruct the SAME split training used: keyed on initial_random_seed (see
-    # setup.compute_split), not the per-run random_seed, so the held-out val/test targets match the
-    # run's training split (critical for BAS holdout, where the seed selects the partition).
-    _, X_val, X_test, c_train, c_val, c_test = dl.train_val_test_split(
+    # setup.compute_split), not the per-run random_seed. The merged target below is split-independent,
+    # but train_counts is NOT -- it is the generalization metrics' seen-set, and under BAS holdout the
+    # seed is what selects the partition, so it must match the split the run actually trained on.
+    _, _X_val, _X_test, c_train, c_val, c_test = dl.train_val_test_split(
         cfg.data.train_split, cfg.data.val_split,
         seed=cfg.sweep.initial_random_seed, bas_split_mode=cfg.data.bas_split_mode)
     valid_patterns = dataset.binary if cfg.data.dataset == "BAS" else None
-    return {"val": c_val, "test": c_test}, valid_patterns, c_train
+    return merge_counts(c_train, c_val, c_test), valid_patterns, c_train
 
 
 _CONNECTIONS_CACHE = {}  # config fingerprint -> new-connection count
@@ -568,20 +605,21 @@ def _run_setup_facts(run) -> dict:
 
 
 def _evaluate_run(run, n_shots: int, which: str = "best") -> dict:
-    """Load one run's checkpoint, sample it, and evaluate the full held-out test metric suite.
+    """Load one run's checkpoint, sample it, and evaluate the full metric suite.
 
     `which` selects "best" (validation-selected, default) or "final" (last training iteration) --
     see load_checkpoint.
 
-    Returns the flat metric dict from `evaluate` (bench_dist/test/{mmd,kl,tv,fidelity}, bench_val/*,
-    plus BAS-only bench_BAS/{precision,recall,qbas}). Shared by benchmark_sweep (best-per-group) and
-    benchmark_all_runs (every run) so a run is scored identically regardless of caller.
+    Returns the flat metric dict from `evaluate` (bench_dist/{mmd,kl,tv,fidelity,nll} against the
+    full train+val+test target, bench_val/*, plus BAS-only bench_BAS/{precision,recall,qbas}).
+    Shared by benchmark_sweep (best-per-group) and benchmark_all_runs (every run) so a run is scored
+    identically regardless of caller.
     """
     circuit, params = load_checkpoint(run, which=which)
     cfg = run_config(run)
-    splits, valid_patterns, train_counts = _test_split_for_config(cfg)
+    target, valid_patterns, train_counts = _full_target_for_config(cfg)
     samples = sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
-    return evaluate(samples, splits, cfg.data.dataset, sigmas=np.array(cfg.qcbm.sigmas),
+    return evaluate(samples, target, cfg.data.dataset, sigmas=np.array(cfg.qcbm.sigmas),
                     valid_patterns=valid_patterns, train_patterns=train_counts)
 
 
@@ -610,8 +648,9 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "c
     For each group (value of `group_by`, a dot-separated path into the run's config, e.g.
     "circuit.extension"), select the seed-run with the lowest validation MMD, load its checkpoint
     (`which`: "best" validation-selected iteration, or "final" -- see load_checkpoint), sample it,
-    and evaluate the full metric suite on the held-out test split. For a bootstrap over ALL runs
-    (mean +/- std across seeds) use benchmark_all_runs instead.
+    and evaluate the full metric suite (distances against the full train+val+test target, see
+    evaluate). For a bootstrap over ALL runs (mean +/- std across seeds) use benchmark_all_runs
+    instead.
 
     `groups` optionally supplies an already-fetched {group_key: [runs]} mapping (e.g. from
     plotting.fetch_runs), skipping the sweep query entirely.
@@ -636,13 +675,13 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "c
 def benchmark_all_runs(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
                        n_shots: int = 10000, metric: str = "best_mmd_val",
                        groups: dict = None, which: str = "best") -> pd.DataFrame:
-    """Evaluate EVERY run's checkpoint on the held-out test split (not just the per-group best).
+    """Evaluate EVERY run's checkpoint with the full metric suite (not just the per-group best).
 
     `which` selects "best" (validation-selected, default) or "final" (last training iteration) for
     EVERY run's checkpoint -- see load_checkpoint.
 
     Returns a tidy table with ONE ROW PER RUN (group_by, run_id, run_name, best_mmd_val,
-    num_parameters, + the full held-out metric suite), so downstream code
+    num_parameters, + the full metric suite), so downstream code
     (plotting.bootstrap_group_metrics) can bootstrap the metrics across the runs of each group --
     the mean +/- across-seed standard error. Each run is scored identically to benchmark_sweep (same
     `which` checkpoint, same n_shots), so the per-group best row of this table matches

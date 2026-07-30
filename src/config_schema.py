@@ -77,7 +77,9 @@ class QcbmConfig:
     finite_diff_epsilon: float = 1.0e-8    # epsilon used in finite difference sampling for KL (does not work yet)
     adam_learning_rate: float = 0.01       # initial learning rate for ADAM
     eval_every: int = 1                    # compute full train/val/test MMD every k iterations (+ final)
-    model_selection_metric: str = "mmd_val"  # metric used to pick the best checkpoint (mmd_val recommended)
+    # metric used to pick the best checkpoint; one of qcbm.MMD_SELECTABLE -- mmd_train, mmd_val
+    # (recommended) or mmd_train_val. Test-derived metrics are rejected (they would leak the split).
+    model_selection_metric: str = "mmd_val"
 
 
 @dataclass

@@ -409,12 +409,6 @@ def plot_train_val_mmd(runs_by_key: dict, mode: str = "bootstrap", window: int =
 # and lead the column order rather than being interleaved among the outcome metrics.
 _SETUP_COLUMNS = ("num_parameters", "n_connections", "total_measurements", "iterations_run")
 
-# bench_dist/val/* dropped from the table/CSV: the validation split already drives model selection
-# (best_mmd_val, above), so its distribution-distance numbers are redundant for comparing groups --
-# the test-split distances (kept) are the actual held-out evaluation.
-_EXCLUDED_METRICS = {"bench_dist/val/mmd", "bench_dist/val/kl", "bench_dist/val/tv",
-                    "bench_dist/val/fidelity"}
-
 
 def bootstrap_group_metrics(per_run_df: pd.DataFrame, group_by: str = "circuit.extension",
                             metric_cols: list = None, n_boot: int = 1000, seed: int = 0) -> pd.DataFrame:
@@ -429,12 +423,12 @@ def bootstrap_group_metrics(per_run_df: pd.DataFrame, group_by: str = "circuit.e
 
     Returns one row per group with, for each metric <m>, a column <m> (bootstrap mean, or plain mean
     for a setup/cost column) and <m>_std (bootstrap SE, omitted for setup/cost columns), plus n_runs.
-    Setup/cost columns lead the column order; bench_dist/val/* is excluded (see _EXCLUDED_METRICS).
+    Setup/cost columns lead the column order.
     """
     if per_run_df is None or per_run_df.empty:
         return None
     if metric_cols is None:
-        skip = {group_by, "run_id", "run_name"} | _EXCLUDED_METRICS
+        skip = {group_by, "run_id", "run_name"}
         numeric_cols = [c for c in per_run_df.columns
                        if c not in skip and np.issubdtype(per_run_df[c].dropna().dtype, np.number)]
         setup_cols = [c for c in _SETUP_COLUMNS if c in numeric_cols]
@@ -476,15 +470,18 @@ def save_metric_table(bench_df: pd.DataFrame, plots_dir: str = "plots",
 # rendered benchmark tables (the full-precision CSV above stays the source of truth; these are the
 # readable per-family cuts of it)
 # --------------------------------------------------------------------------------------------------
-# Which direction is "better" per metric, for the bold-best marking. Distances and divergences are
-# MINIMIZED (mmd, kl, tv); scores, fidelities, coverages and rates are MAXIMIZED. A column absent
-# from this map is never bolded -- see _TABLE_SPECS for why the setup/cost table has no "best".
+# Which direction is "better" per metric, for the bold-best marking. Distances, divergences and
+# negative log-likelihoods are MINIMIZED (mmd, kl, tv, nll); scores, fidelities, coverages and rates
+# are MAXIMIZED. A column absent from this map is never bolded -- see _TABLE_SPECS for why the
+# setup/cost table has no "best". bench_dist/* is scored against the FULL dataset (train+val+test
+# merged), not per split -- see benchmark.evaluate.
 _LOWER_IS_BETTER = {
     "best_mmd_val": True,
-    "bench_dist/test/mmd": True,
-    "bench_dist/test/kl": True,
-    "bench_dist/test/tv": True,
-    "bench_dist/test/fidelity": False,
+    "bench_dist/mmd": True,
+    "bench_dist/kl": True,
+    "bench_dist/tv": True,
+    "bench_dist/nll": True,
+    "bench_dist/fidelity": False,
     "bench_val/coverage": False,
     "bench_val/fidelity": False,
     "bench_val/rate": False,
@@ -515,11 +512,12 @@ _TABLE_SPECS = (
       ("bench_val/fidelity", "fidelity"),
       ("bench_val/rate", "rate"),
       ("bench_val/exploration", "exploration"))),
-    ("benchmark_table_distribution", "Distribution distance metrics", True,
-     (("bench_dist/test/mmd", "MMD"),
-      ("bench_dist/test/kl", "KL"),
-      ("bench_dist/test/tv", "TV"),
-      ("bench_dist/test/fidelity", "fidelity"))),
+    ("benchmark_table_distribution", "Distribution distance metrics (full dataset)", True,
+     (("bench_dist/mmd", "MMD"),
+      ("bench_dist/kl", "KL"),
+      ("bench_dist/tv", "TV"),
+      ("bench_dist/nll", "NLL"),
+      ("bench_dist/fidelity", "fidelity"))),
     ("benchmark_table_bas", "BAS metrics", True,
      (("bench_BAS/precision", "precision"),
       ("bench_BAS/recall", "recall"),
@@ -647,7 +645,6 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
         print(f"[plotting]     [{key}] QQ plots from best run {best.id}...")
         circuit, params = bm.load_checkpoint(best, which=which)
         samples = bm.sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
-        splits, _, _ = bm._test_split_for_config(cfg)
         jgb = JGB(cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer); dl = DataLoader(jgb)
         dl.train_val_test_split(cfg.data.train_split, cfg.data.val_split)
         bpf = jgb.bits_per_feature
@@ -683,10 +680,11 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
 # figure, labelled with its raw column name.
 _BENCH_METRIC_LABELS = {
     "best_mmd_val": "best validation MMD",
-    "bench_dist/test/mmd": "MMD (test)",
-    "bench_dist/test/kl": "KL divergence (test)",
-    "bench_dist/test/tv": "total variation (test)",
-    "bench_dist/test/fidelity": "classical fidelity (test)",
+    "bench_dist/mmd": "MMD (full dataset)",
+    "bench_dist/kl": "KL divergence (full dataset)",
+    "bench_dist/tv": "total variation (full dataset)",
+    "bench_dist/nll": "negative log-likelihood (full dataset)",
+    "bench_dist/fidelity": "classical fidelity (full dataset)",
     "bench_val/coverage": "coverage",
     "bench_val/fidelity": "validity fidelity",
     "bench_val/rate": "rate",
@@ -847,13 +845,18 @@ def _render_metric_vs_threshold(bench_df, group_by, metric, references, plots_di
 # --------------------------------------------------------------------------------------------------
 # orchestrator
 # --------------------------------------------------------------------------------------------------
-# the three per-step MMD splits generate_all_figures plots by default; each gets a "MMD" ylabel and
-# a title of just the split name, instead of the generic metric-name-derived labeling (see
+# The per-step MMD targets logged by training (see qcbm.MMD_KEYS): each gets a "MMD" ylabel and a
+# title of just the split name, instead of the generic metric-name-derived labeling (see
 # plot_mmd_vs_measurements) -- any OTHER metric passed via `metrics` keeps that generic behavior.
+# generate_all_figures plots the three single splits by default; the union targets are plotted when
+# asked for explicitly (--metrics), and titled from here when they are.
 _MMD_SPLIT_TITLES = {
     "train/mmd_train": "Training",
     "train/mmd_val": "Validation",
     "train/mmd_test": "Test",
+    "train/mmd_train_val": "Training + Validation",
+    "train/mmd_train_test": "Training + Test",
+    "train/mmd_train_val_test": "Full Dataset",
 }
 
 
@@ -861,7 +864,7 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
                          group_by: str = "circuit.extension",
                          metrics=("train/mmd_train", "train/mmd_val", "train/mmd_test"),
                          plots_dir: str = "plots", science_style: bool = True, n_boot: int = 1000,
-                         which: str = "best"):
+                         which: str = "best", n_shots: int = 10000):
     """Generate the training-dependent figure set for a sweep: metric-vs-measurements curves (train
     and val MMD combined into one side-by-side figure, see plot_train_val_mmd) + bootstrap benchmark
     (metric table, and QQ grids for JGB). Both the curves and the benchmark aggregate ACROSS ALL
@@ -870,6 +873,12 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     benchmarked/sampled -- "best" (validation-selected, default) or "final" (see
     benchmark.load_checkpoint). Saves PDFs to plots_dir/<sweep_id>-<dataset>/, so figures from
     different sweeps/datasets never collide.
+
+    `n_shots` is how many shots each checkpoint is sampled with for the benchmark suite and the JGB
+    QQ grids. It sets the sampling-noise floor on every reported metric -- the model distribution is
+    estimated from n_shots draws, so group differences smaller than that noise are not resolvable --
+    and it is the dominant cost of a plotting pass (one simulation per run). Raise it when the
+    across-seed error bars are small enough that shot noise dominates them.
 
     Static dataset/topology/threshold figures (SU(4) gate, preprocessing, threshold curve,
     extension heatmaps, topology networks) don't depend on training and are NOT generated here --
@@ -881,7 +890,8 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     dataset = dataset_cfg.get("dataset", "BAS")
     plots_dir = os.path.join(plots_dir, f"{sweep_id}-{dataset}")
 
-    print(f"[plotting] sweep={sweep_id} dataset={dataset} group_by={group_by} which={which} -> {plots_dir}/")
+    print(f"[plotting] sweep={sweep_id} dataset={dataset} group_by={group_by} which={which} "
+          f"n_shots={n_shots:,} -> {plots_dir}/")
 
     # 1) metric-vs-measurements, bootstrapped over all seeds
     #
@@ -905,7 +915,7 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
             continue
         print(f"[plotting]     plotting {metric} vs. measurements (bootstrap over seeds)...")
         split = _MMD_SPLIT_TITLES.get(metric)
-        # metric names may contain "/" (e.g. "bench_dist/test/mmd"); flatten to "_" so the filename
+        # metric names may contain "/" (e.g. "bench_dist/mmd"); flatten to "_" so the filename
         # doesn't imply a nested directory that was never created (plots_dir is the only dir made).
         plot_mmd_vs_measurements(grouped, metric=metric, n_boot=n_boot,
                                  log_axes=split is not None,
@@ -921,17 +931,19 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     print("[plotting] (2/2) benchmarking all runs per group (bootstrap over seeds)...")
     # `grouped` is passed through so the benchmark reuses the run list fetched above instead of
     # re-querying the sweep (same for the point-estimate fallback and the QQ grids).
-    per_run = bm.benchmark_all_runs(sweep_id, entity, project, group_by, which=which, groups=grouped)
+    per_run = bm.benchmark_all_runs(sweep_id, entity, project, group_by, n_shots=n_shots,
+                                    which=which, groups=grouped)
     bench_df = bootstrap_group_metrics(per_run, group_by=group_by, n_boot=n_boot)
     if bench_df is None or bench_df.empty:
         # e.g. no run had a usable checkpoint -> fall back to the best-per-group point estimate
         print("[plotting]     no per-run metrics; falling back to best-per-group point estimate.")
-        bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by, which=which, groups=grouped)
+        bench_df = bm.benchmark_sweep(sweep_id, entity, project, group_by, n_shots=n_shots,
+                                      which=which, groups=grouped)
     save_metric_table(bench_df, plots_dir=plots_dir)          # full-precision CSV (all columns)
     plot_benchmark_tables(bench_df, group_by=group_by, plots_dir=plots_dir)  # readable per-family cuts
     if dataset == "JGB":
-        plot_qq_grid(sweep_id, entity, project, group_by, plots_dir=plots_dir, runs_by_key=grouped,
-                    which=which)
+        plot_qq_grid(sweep_id, entity, project, group_by, n_shots=n_shots, plots_dir=plots_dir,
+                    runs_by_key=grouped, which=which)
     print("[plotting]     done.")
     print(f"[plotting] finished -- figures in {plots_dir}/")
     return bench_df
@@ -961,14 +973,19 @@ def _parse_args(argv=None):
                         default=["train/mmd_train", "train/mmd_val", "train/mmd_test"],
                         help="Logged metrics to plot vs. cumulative measurements.")
     parser.add_argument("--which", choices=["best", "final"], default="final",
-                        help="Which checkpoint to benchmark/sample: best (validation-selected, "
-                             "default) or final (last training iteration).")
+                        help="Which checkpoint to benchmark/sample: best (validation-selected) or "
+                             "final (last training iteration, default).")
     parser.add_argument("--threshold-sweep", action="store_true",
                         help="Treat this sweep as a circuit.threshold sweep: plot every benchmark "
                              "metric vs. threshold (one figure each) with knee/percolation markers, "
                              "instead of the standard per-extension figure set.")
     parser.add_argument("--n-boot", type=int, default=1000,
                         help="Bootstrap resamples for the across-seed mean/SE (curves + benchmark).")
+    parser.add_argument("--n-shots", type=int, default=10000,
+                        help="Shots used to sample each checkpoint for the benchmark metrics (and "
+                             "the JGB QQ grids). Sets the sampling-noise floor on every reported "
+                             "metric and is the dominant cost of a pass; raise it once the "
+                             "across-seed error bars are smaller than the shot noise.")
     parser.add_argument("--plots-dir", default="plots", help="Output directory for the PDFs/PNGs.")
     parser.add_argument("--no-science-style", action="store_true",
                         help="Skip the scienceplots styling (use matplotlib defaults).")
@@ -984,7 +1001,8 @@ def main(argv=None):
             use_science_style()  # generate_all_figures does this itself; this branch bypasses it
         bench_df, _figs = plot_metrics_vs_threshold(
             sweep_id=args.sweep_id, entity=args.entity, project=args.project,
-            group_by=group_by, n_boot=args.n_boot, which=args.which, plots_dir=args.plots_dir,
+            group_by=group_by, n_shots=args.n_shots, n_boot=args.n_boot, which=args.which,
+            plots_dir=args.plots_dir,
         )
         print(f"Figures written to {args.plots_dir}/{args.sweep_id}-threshold/")
         if bench_df is not None and not bench_df.empty:
@@ -1003,6 +1021,7 @@ def main(argv=None):
         science_style=not args.no_science_style,
         n_boot=args.n_boot,
         which=args.which,
+        n_shots=args.n_shots,
     )
 
 

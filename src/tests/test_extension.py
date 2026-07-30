@@ -33,6 +33,45 @@ def test_nearest_neighbor_topology():
     assert sorted(set([tuple(sorted(c)) for c in extension])) == sorted(set([tuple(sorted(c)) for c in correct_extension]))
 
 
+def test_nearest_neighbor_extension_as_simulated():
+    """The nearest-neighbor extension as setup.setup_circuit_extensions actually builds it:
+    nearest_neighbor_topology's index pairs are used as FIXED qubit indices, differenced against the
+    linear_topology(range(N_qubits)) baseline -- setup never maps them through init_qubit_order_bas.
+    Pinned against run clsxmzpk's log (Extension connections: 12, New connections: 6)."""
+    linear_connections = linear_topology(list(range(9)))
+    nn_connections = nearest_neighbor_topology(3, 3)
+    extension = sorted(set(nn_connections) - set(linear_connections))
+
+    assert len(nn_connections) == 12
+    assert extension == [(0, 3), (1, 4), (2, 5), (3, 6), (4, 7), (5, 8)]
+
+
+def test_relabelling_preserves_new_connection_count():
+    """plot_extension draws every topology on the dataset's feature labels (init_qubit_order_bas)
+    instead of the qubit indices. That relabelling must never change how many NEW connections a panel
+    reports, else the figure's "+params" stops matching the "New connections" in a run's log -- which
+    is exactly what happened when one panel was left unrelabelled (nearest-neighbor read 4 edges/+60
+    against a run that logs 6/+90)."""
+    from src.plot_extension import _to_labels  # plotting-only helper; simulation never sees it
+
+    labels = init_topologies["BAS_3x3"]
+    sim_chain = linear_topology(list(range(9)))
+    plot_chain = linear_topology(labels)
+    logged_new = {"nearest_neighbor": 6, "metric_based": 4}  # runs clsxmzpk / gqr78zjr
+
+    topologies = {
+        "nearest_neighbor": nearest_neighbor_topology(3, 3),
+        # varinfo @ knee=0.81 on the BAS 3x3 train split, verbatim from run gqr78zjr's log
+        "metric_based": [(0, 5), (1, 4), (2, 3), (3, 8), (4, 7), (5, 6)],
+    }
+    for name, edges in topologies.items():
+        sim_new = set(edges) - set(sim_chain)
+        plot_new = set(_to_labels(edges, labels)) - set(plot_chain)
+        assert len(plot_new) == len(sim_new) == logged_new[name], name
+        # the drawn extension is the simulated one relabelled -- no edge invented or dropped
+        assert plot_new == set(_to_labels(sim_new, labels)), name
+
+
 def test_random_topology():
     
     iterations = 1000
