@@ -147,10 +147,39 @@ class FeatureQuantizer:
                              "map out-of-bounds values onto the extreme bins")
         return k
 
-    def decode_levels(self, k, feature: int) -> np.ndarray:
-        """Integer codes -> real values for one feature (inverse of `levels`, up to bin width)."""
+    def levels_for_feature(self, x, feature: int, clip: bool = True) -> np.ndarray:
+        """Integer codes for a single feature's values -- same truncation semantics as `levels`, but
+        for a 1-D array rather than a full (n_samples, n_features) row. For values that were never
+        part of an (n_samples, n_features) batch, e.g. a synthetic reference distribution fit to one
+        feature in isolation (see benchmark.qq_quantized_gaussian_vs_data)."""
         lo, hi = self._bounds(feature)
-        return self.unwarp(lo + np.asarray(k, dtype=float) * (hi - lo) / self.max_int, feature)
+        k = (self.max_int * (self.warp(x, feature) - lo) / (hi - lo)).astype(int)
+        if clip:
+            return np.clip(k, 0, self.max_int)
+        if (k < 0).any() or (k > self.max_int).any():
+            raise ValueError("quantized level out of range with clip=False; pass clip=True to "
+                             "map out-of-bounds values onto the extreme bins")
+        return k
+
+    def decode_levels(self, k, feature: int, center: bool = False) -> np.ndarray:
+        """Integer codes -> real values for one feature (inverse of `levels`, up to bin width).
+
+        center=False reconstructs the bin's LOWER EDGE, which is what makes decode(encode(x)) <= x
+        bit-for-bit (see `levels`, which truncates). That is a one-sided error of up to a full bin
+        width, so it does not cancel in aggregate: a reconstructed distribution is biased low by
+        ~half a bin, and for a `minmax` grid on heavy-tailed data (bin width >= the data's IQR) that
+        bias is the dominant term in any real-space comparison against the unquantized data.
+
+        center=True reconstructs the bin MIDPOINT in warped space instead -- the MSE-optimal
+        representative under a uniform-within-bin prior, halving that error. Use it whenever the
+        decoded values are compared against real data rather than round-tripped (see
+        benchmark.reconstruct_features, which defaults to it). The shift is applied uniformly to
+        every level, including the two clipped end bins: they hold negligible mass, and special-
+        casing them changes nothing measurable while costing the mapping its monotone regularity.
+        """
+        lo, hi = self._bounds(feature)
+        k = np.asarray(k, dtype=float) + (0.5 if center else 0.0)
+        return self.unwarp(lo + k * (hi - lo) / self.max_int, feature)
 
     # ------------------------------------------------------------------------- encode / decode
     def encode(self, data: np.ndarray, clip: bool = True) -> np.ndarray:
@@ -163,8 +192,12 @@ class FeatureQuantizer:
                 out[:, n * b + m] = (k[:, n] >> (b - 1 - m)) & 1
         return out
 
-    def decode(self, binary: np.ndarray) -> np.ndarray:
-        """Binary (n_samples, b * n_features) -> real values (n_samples, n_features)."""
+    def decode(self, binary: np.ndarray, center: bool = False) -> np.ndarray:
+        """Binary (n_samples, b * n_features) -> real values (n_samples, n_features).
+
+        `center` selects the bin midpoint over its lower edge -- see decode_levels; the default keeps
+        the round trip decode(encode(x)) <= x.
+        """
         binary = np.atleast_2d(np.asarray(binary, dtype=int))
         b = self.bits_per_feature
         n_features = binary.shape[1] // b
@@ -172,7 +205,7 @@ class FeatureQuantizer:
         out = np.zeros((binary.shape[0], n_features), dtype=float)
         for n in range(n_features):
             k = binary[:, n * b:(n + 1) * b] @ weights
-            out[:, n] = self.decode_levels(k, n)
+            out[:, n] = self.decode_levels(k, n, center=center)
         return out
 
     @property

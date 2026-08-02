@@ -245,7 +245,7 @@ def generalization_metrics(samples: dict, train_patterns, valid_patterns=None) -
 # JGB-specific metrics (binarized continuous, per feature)
 # --------------------------------------------------------------------------------------------------
 def reconstruct_features(samples: dict, bits_per_feature: int, num_features: int,
-                         x_min=None, x_max=None, quantizer=None) -> list:
+                         x_min=None, x_max=None, quantizer=None, center: bool = True) -> list:
     """Reconstruct per-feature real-valued marginals from a model-sample dict.
 
     Returns a list of (values, probs) per feature, inverting with the train-fitted quantizer so the
@@ -254,6 +254,13 @@ def reconstruct_features(samples: dict, bits_per_feature: int, num_features: int
     Pass `quantizer` (DataLoader.quantizer after train_val_test_split) whenever available -- it is
     REQUIRED for the arcsinh encoding, whose bounds live in warped space. The x_min/x_max form is
     the legacy path and is only correct for the affine "minmax" encoding.
+
+    `center` decodes each level to its bin MIDPOINT (FeatureQuantizer.decode_levels) and defaults to
+    True here: every consumer of this function compares the result against unquantized real data
+    (QQ plots, per-feature Wasserstein), where the lower-edge convention's one-sided half-bin bias is
+    a pure artifact -- on a `minmax` grid whose bin width exceeds the data's IQR it dominates the
+    model error it is supposed to expose. Pass center=False only to reproduce a round trip against
+    encode().
     """
     feat_dicts = get_features_for_quasi_dist(samples, bits_per_feature, num_features)
     if quantizer is None:
@@ -267,7 +274,7 @@ def reconstruct_features(samples: dict, bits_per_feature: int, num_features: int
     for n, fdict in enumerate(feat_dicts):
         vals, probs = [], []
         for bitstring, p in fdict.items():
-            vals.append(float(quantizer.decode_levels(int(bitstring, 2), n)))
+            vals.append(float(quantizer.decode_levels(int(bitstring, 2), n, center=center)))
             probs.append(p)
         out.append((np.array(vals), np.array(probs)))
     return out
@@ -292,6 +299,76 @@ def qq_data_vs_normal(data_vals, n_q: int = 100):
     q = np.linspace(0.01, 0.99, n_q)
     mean, std = np.mean(data_vals), np.std(data_vals)
     return ss.norm.ppf(q, loc=mean, scale=std), np.quantile(data_vals, q)
+
+
+# --------------------------------------------------------------------------------------------------
+# QQ reference curves for one feature's quantization grid
+#
+# Both live on the same 2**b-point lattice as any model marginal and are read off with the same
+# estimator (weighted_quantile, via qq_model_vs_data), so they are directly comparable to the model
+# curves they share a panel with. Matching the ESTIMATOR is not cosmetic: weighted_quantile
+# interpolates the CDF across the lattice while np.quantile over materialized samples interpolates
+# order statistics (i.e. snaps to lattice points), and on a 16-level grid the two answers differ by up
+# to a full bin width -- as large as the quantization effect itself.
+#
+# Both are exact: neither carries sampling noise, whereas the model curves are estimated from n_shots
+# draws. That asymmetry is deliberate and immaterial here -- resampling the exact target with 10k
+# shots moves its QQ curve by <1% of a bin.
+# --------------------------------------------------------------------------------------------------
+def quantized_marginal(quantizer, values: np.ndarray, feature: int, center: bool = True):
+    """(values, probs) for `values` round-tripped through one feature's quantization grid."""
+    decoded = quantizer.decode_levels(quantizer.levels_for_feature(values, feature),
+                                      feature, center=center)
+    v, counts = np.unique(decoded, return_counts=True)
+    return v, counts / counts.sum()
+
+
+def qq_quantized_data_vs_data(quantizer, feature: int, data_vals: np.ndarray, n_q: int = 100,
+                              center: bool = True):
+    """Quantile pairs (data, quantized data): the quantization-only floor for a QQ-vs-data panel.
+
+    The empirical data pushed through this feature's encode/decode round trip -- a PERFECT model, with
+    zero training or expressivity error, whose only departure from the data is the finite resolution
+    of the grid. No model curve can be closer to the diagonal than this, so in a shared panel the gap
+    from the diagonal to this curve is quantization and the gap from this curve to a model's is that
+    model's error.
+
+    Note this is the floor a *quantized-Gaussian* curve is NOT: a Gaussian is itself a wrong model of
+    heavy-tailed data, so its offset mixes quantization with its own misfit and a good model can beat
+    it (see qq_quantized_gaussian_vs_data).
+    """
+    return qq_model_vs_data(*quantized_marginal(quantizer, data_vals, feature, center), data_vals, n_q)
+
+
+def qq_quantized_gaussian_vs_data(quantizer, feature: int, data_vals: np.ndarray, n_q: int = 100,
+                                  center: bool = True):
+    """Quantile pairs (data, quantized Gaussian): a parametric BASELINE on the same lattice.
+
+    A Gaussian fitted to the QUANTIZED data (mean/std of the round-tripped marginal, so it is fitted
+    in the same space the models are read in) is placed on the lattice ANALYTICALLY -- each level's
+    probability is the normal mass between its bin edges, mapped through the warp -- rather than by
+    sampling and re-binning. That keeps it free of sampling noise and of the order-statistic snapping
+    that np.quantile would introduce.
+
+    This is a baseline MODEL, not a quantization floor: its distance from the diagonal is quantization
+    PLUS the Gaussian's own misfit of the data (for heavy-tailed features, substantial), so a model
+    beating this curve is beating the Gaussian, not beating quantization. For the floor itself use
+    qq_quantized_data_vs_data.
+    """
+    v, p = quantized_marginal(quantizer, data_vals, feature, center)
+    mean = float(np.sum(v * p))
+    std = float(np.sqrt(np.sum(p * (v - mean) ** 2)))
+    # interior bin edges in warped space -> data space; the two end levels absorb everything beyond
+    # them (see FeatureQuantizer.levels, which clips), hence the infinite outer edges
+    lo, hi = quantizer.w_min[feature], quantizer.w_max[feature]
+    width = (hi - lo) / quantizer.max_int
+    edges = [-np.inf]
+    edges += [float(quantizer.unwarp(lo + j * width, feature)) for j in range(1, quantizer.max_int + 1)]
+    edges += [np.inf]
+    probs = np.diff(ss.norm.cdf(np.array(edges), loc=mean, scale=std))
+    vals = np.asarray(quantizer.decode_levels(np.arange(quantizer.max_int + 1), feature, center=center),
+                      dtype=float)
+    return qq_model_vs_data(vals, probs, data_vals, n_q)
 
 
 def wasserstein_per_feature(model_vals, model_probs, data_vals) -> float:
@@ -436,8 +513,23 @@ def reset_wandb_cache():
 # --------------------------------------------------------------------------------------------------
 # best-model selection across a wandb group
 # --------------------------------------------------------------------------------------------------
-def select_best_run(runs: list, metric: str = "best_mmd_val"):
-    """Return the run with the minimum summary metric (lowest validation MMD by default)."""
+def select_best_run(runs: list, metric: str = "train/mmd_train"):
+    """Return the run with the minimum summary metric (lowest final-iteration TRAINING MMD by default;
+    the summary holds each metric's last-logged value unless explicitly overridden).
+
+    The default is deliberately NOT "best_mmd_val", which records the val-SELECTED checkpoint: in this
+    pipeline that selection fires at initialization for most runs (best_iter == 1), so it ranks
+    near-untrained models. Validation at the final iteration is available and leak-free but barely
+    discriminates here (~1.03x between group medians against ~1.13x scatter between seeds of one
+    group), so it ranks noise; final-iteration training MMD separates by ~10x with tight within-group
+    ranges. The trade-off is that ranking seeds by training fit prefers whichever seed fit the training
+    sample hardest, so the winner is a REPRESENTATIVE model, not evidence of generalization -- keep the
+    quantitative claims on metrics bootstrapped over all seeds (see benchmark_all_runs).
+
+    Pair this with load_checkpoint(which="final") so the checkpoint scored is the iteration the metric
+    was measured on. Never pass a test-split metric here -- selecting a run by it leaks the split every
+    downstream figure and table is then read against.
+    """
     scored = [(r, r.summary.get(metric, np.inf)) for r in runs]
     scored = [(r, s) for r, s in scored if s is not None and np.isfinite(s)]
     if not scored:
@@ -445,10 +537,10 @@ def select_best_run(runs: list, metric: str = "best_mmd_val"):
     return min(scored, key=lambda rs: rs[1])[0]
 
 
-def load_checkpoint(run, root: str = "./artifacts", which: str = "best"):
+def load_checkpoint(run, root: str = "./artifacts", which: str = "final"):
     """Download a run's model artifact and load (circuit, params).
 
-    `which` selects "best" (validation-selected, default) or "final" (last training iteration) --
+    `which` selects "final" (last training iteration, default) or "best" (validation-selected) --
     see QCBM.save, which persists both checkpoints (best_params.npy / final_params.npy) alongside
     the circuit in every run's model artifact.
 
@@ -604,10 +696,10 @@ def _run_setup_facts(run) -> dict:
             "iterations_run": run.summary.get("iterations_run")}
 
 
-def _evaluate_run(run, n_shots: int, which: str = "best") -> dict:
+def _evaluate_run(run, n_shots: int, which: str = "final") -> dict:
     """Load one run's checkpoint, sample it, and evaluate the full metric suite.
 
-    `which` selects "best" (validation-selected, default) or "final" (last training iteration) --
+    `which` selects "final" (last training iteration, default) or "best" (validation-selected) --
     see load_checkpoint.
 
     Returns the flat metric dict from `evaluate` (bench_dist/{mmd,kl,tv,fidelity,nll} against the
@@ -641,13 +733,15 @@ def _group_runs(sweep_id: str, entity: str, project: str, group_by: str) -> dict
 
 
 def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
-                    n_shots: int = 10000, metric: str = "best_mmd_val",
-                    groups: dict = None, which: str = "best") -> pd.DataFrame:
+                    n_shots: int = 10000, metric: str = "train/mmd_train",
+                    groups: dict = None, which: str = "final") -> pd.DataFrame:
     """Benchmark the best model per group of a sweep (point estimate, one row per group).
 
     For each group (value of `group_by`, a dot-separated path into the run's config, e.g.
-    "circuit.extension"), select the seed-run with the lowest validation MMD, load its checkpoint
-    (`which`: "best" validation-selected iteration, or "final" -- see load_checkpoint), sample it,
+    "circuit.extension"), select the seed-run with the lowest `metric` (see select_best_run, whose
+    default this mirrors: final-iteration validation MMD, not the val-SELECTED checkpoint's
+    best_mmd_val), load its checkpoint
+    (`which`: "final" last iteration by default, or "best" -- see load_checkpoint), sample it,
     and evaluate the full metric suite (distances against the full train+val+test target, see
     evaluate). For a bootstrap over ALL runs (mean +/- std across seeds) use benchmark_all_runs
     instead.
@@ -666,21 +760,21 @@ def benchmark_sweep(sweep_id: str, entity: str, project: str, group_by: str = "c
         print(f"[benchmark]     [{key}] best run {best.id} ({metric}={best.summary.get(metric)}); "
               f"evaluating checkpoint...")
         row = {group_by: key, "run_id": best.id, "run_name": best.name,
-               "best_mmd_val": best.summary.get(metric), **_run_setup_facts(best)}
+               "selection_metric": best.summary.get(metric), **_run_setup_facts(best)}
         row.update(_evaluate_run(best, n_shots, which=which))
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def benchmark_all_runs(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
-                       n_shots: int = 10000, metric: str = "best_mmd_val",
-                       groups: dict = None, which: str = "best") -> pd.DataFrame:
+                       n_shots: int = 10000, metric: str = "train/mmd_train",
+                       groups: dict = None, which: str = "final") -> pd.DataFrame:
     """Evaluate EVERY run's checkpoint with the full metric suite (not just the per-group best).
 
-    `which` selects "best" (validation-selected, default) or "final" (last training iteration) for
+    `which` selects "final" (last training iteration, default) or "best" (validation-selected) for
     EVERY run's checkpoint -- see load_checkpoint.
 
-    Returns a tidy table with ONE ROW PER RUN (group_by, run_id, run_name, best_mmd_val,
+    Returns a tidy table with ONE ROW PER RUN (group_by, run_id, run_name, selection_metric,
     num_parameters, + the full metric suite), so downstream code
     (plotting.bootstrap_group_metrics) can bootstrap the metrics across the runs of each group --
     the mean +/- across-seed standard error. Each run is scored identically to benchmark_sweep (same
@@ -704,7 +798,7 @@ def benchmark_all_runs(sweep_id: str, entity: str, project: str, group_by: str =
                 print(f"[benchmark]     [{key}] skipping run {r.id}: {e!r}")
                 continue
             row = {group_by: key, "run_id": r.id, "run_name": r.name,
-                   "best_mmd_val": r.summary.get(metric), **_run_setup_facts(r)}
+                   "selection_metric": r.summary.get(metric), **_run_setup_facts(r)}
             row.update(metrics)
             rows.append(row)
     return pd.DataFrame(rows)

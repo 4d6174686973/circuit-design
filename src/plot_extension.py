@@ -2,7 +2,7 @@
 
 Everything here depends only on the dataset + Hydra config -- never on a trained/wandb run -- so it
 only needs to be regenerated when the data or extension settings change, unlike the per-sweep
-figures in src.plotting (MMD curves, benchmark tables, QQ grids). The SU(4) gate diagram is more
+figures in src.plotting (MMD curves, benchmark tables, the QQ figure). The SU(4) gate diagram is more
 general still: it doesn't depend on the dataset at all, so it is written once to a shared
 `general/` folder rather than duplicated per dataset.
 
@@ -29,7 +29,7 @@ import networkx as nx
 from hydra import initialize, compose
 
 import src.config_schema  # noqa: F401 -- registers Config with Hydra's ConfigStore for compose()
-from src.extension import (linear_topology, nearest_neighbor_topology, all_to_all_topology,
+from src.extension import (linear_topology, all_to_all_topology,
                            metric_based_topology, chow_liu_topology, add_su4_gate,
                            connection_threshold_curve, select_threshold, knee_threshold,
                            percolation_threshold)
@@ -147,7 +147,7 @@ def plot_bas_images(width=3, height=3, train_split=0.5, val_split=0.25, seed=Non
         ax.set_xticks([]); ax.set_yticks([])
     handles = [Patch(facecolor="none", edgecolor=_split_color(l), linewidth=2,
                     label=f"{' + '.join(_SPLIT_LABELS.get(s, s) for s in l.split('+'))} "
-                          f"({100 * label_counts[l] / n:.0f}%)")
+                          f"({label_counts[l]})")
               for l in sorted(set(labels), key=_split_sort_key)]
     fig.legend(handles=handles, loc="upper center", ncol=len(handles), fontsize=18,
               bbox_to_anchor=(0.5, 1.0 + 0.4 / nrows), frameon=False)
@@ -189,13 +189,17 @@ def plot_jgb_raw_data(N_qubits=12, N_features=3, train_split=0.5, val_split=0.25
     ax.add_artist(line_legend)
     split_handles = [Patch(facecolor=_split_color(s), alpha=0.3,
                           label=f"{s} ({100 * split_counts[s] / N:.0f}%)") for s in _SPLIT_ORDER]
-    ax.legend(handles=split_handles, loc="upper left", bbox_to_anchor=(1.02, 0.55), fontsize=7,
-             title="Split", **legend_box_style)
+    split_legend = ax.legend(handles=split_handles, loc="upper left", bbox_to_anchor=(1.02, 0.55),
+                             fontsize=7, title="Split", **legend_box_style)
 
     ax.set_xlabel("Date"); ax.set_ylabel("Interest Rate [%]")
     plt.tight_layout()
     if save:
-        _save(fig, plots_dir, "JGB_raw_data")
+        # both legends sit outside the axes -- see line_legend/split_legend above -- so savefig's
+        # tight-bbox pass needs both listed explicitly (see _save) or the orphaned line_legend gets
+        # clipped at the figure's right edge instead of padded like split_legend (the axes' current
+        # legend, auto-included).
+        _save(fig, plots_dir, "JGB_raw_data", extra_artists=[line_legend, split_legend])
     return fig
 
 
@@ -263,6 +267,37 @@ def plot_threshold_curve(curves: dict, selected_rule: str = "knee", selected_met
     return fig
 
 
+_THRESHOLD_RULE_COLORS = {"knee": OKABE_ITO["vermillion"], "percolation": OKABE_ITO["orange"]}
+
+
+def plot_selected_threshold_curve(curves: dict, selected_rule: str, selected_metric: str,
+                                  plots_dir: str = "plots", filename: str = "threshold_curve_selected",
+                                  save: bool = True):
+    """Connections-vs-threshold curve for ONLY the metric/rule combination the dataset config
+    actually uses (cfg.circuit.extension_metric / cfg.circuit.threshold_rule) -- a single-subplot,
+    single-marker companion to plot_threshold_curve's full comparison-across-metrics-and-rules
+    figure, for callers that just want "what did this run actually select" without the other
+    metric/rule shown alongside it. `curves` is the same {metric: (thresholds, counts, knee,
+    percolation)} mapping generate_extension_figures already builds for plot_threshold_curve."""
+    thresholds, counts, knee, percolation = curves[selected_metric]
+    value = knee if selected_rule == "knee" else percolation
+    color = _THRESHOLD_RULE_COLORS[selected_rule]
+    threshold_idx = int(np.argmin(np.abs(thresholds - value)))
+    threshold_count = int(counts[threshold_idx])
+
+    fig, ax = plt.subplots(1, 1, figsize=(3, 2))
+    ax.plot(thresholds, counts, color=OKABE_ITO["blue"])
+    ax.axvline(value, color=color, ls="--", lw=1.2,
+              label=f"{selected_rule} @ {value:.3f} ({threshold_count} conn.)")
+    ax.legend(fontsize=7, loc="best", frameon=True, framealpha=0.85)
+    ax.set_title(_METRIC_LABELS.get(selected_metric, selected_metric), fontsize=9)
+    ax.set_xlabel("Threshold"); ax.set_ylabel("Number of Connections")
+    plt.tight_layout()
+    if save:
+        _save(fig, plots_dir, filename)
+    return fig
+
+
 def plot_extension_heatmap(distmat: np.ndarray, threshold: float, rule: str = "knee",
                            plots_dir: str = "plots", metric_label: str = "Distance",
                            filename: str = "extension_heatmap", save: bool = True):
@@ -317,8 +352,7 @@ def _node_labels(cfg) -> list:
 
     PLOTTING ONLY -- nothing here feeds a circuit; the simulation's qubit indices and connections are
     untouched. The labels are the dataset's own feature indices (for BAS: grid-pixel positions), which
-    is what a reader of these figures interprets the node numbers as, and what
-    nearest_neighbor_topology's grid adjacency is defined over. The circuit runs on qubits that
+    is what a reader of these figures interprets the node numbers as. The circuit runs on qubits that
     DataLoader.reorder_features has permuted those features onto -- qubit k carries feature
     init_qubit_order_bas[k] -- so the map below is exactly that permutation, and identity for every
     config reorder_features leaves alone (JGB, and BAS grids with no entry).
@@ -336,25 +370,19 @@ def _to_labels(connections: list, labels: list) -> list:
 
 def plot_topology_panel(cfg, X_train: np.ndarray, distmat: np.ndarray, threshold: float,
                         rule: str = "knee", plots_dir: str = "plots", save: bool = True):
-    """Topology networks for every extension method, drawn on the dataset's own feature indices
+    """Topology networks for the plotted extension methods, drawn on the dataset's own feature indices
     (BAS: grid-pixel positions -- see _node_labels), showing exactly the graphs
-    setup.setup_circuit_extensions builds.
+    setup.setup_circuit_extensions builds. The nearest-neighbor extension is deliberately NOT plotted
+    (it is excluded from every figure -- see plotting.EXCLUDED_EXTENSIONS); setup/extension still
+    implement it, so a run can be configured with it, it just no longer appears in the figure set.
 
     The MPS chain is setup's linear_topology(range(N_qubits)) over data reorder_features has already
     permuted, so on these labels it is the snake path 0-1-2-5-4-3-6-7-8 for BAS 3x3, not 0-...-8: the
     same physical circuit, read on the grid. EVERY extension graph is relabelled the same way, by
-    _to_labels -- whatever setup hands to extend_circuit is a list of QUBIT pairs, including
-    nearest_neighbor_topology's, whose grid-index pairs setup consumes as qubit indices without
-    permuting them. Relabelling chain and extension together is a bijection, so each panel's NEW-edge
-    count is exactly the "New connections" its run logs: 6 nearest-neighbor / 4 metric-based /
-    5 Chow-Liu / 28 all-to-all for BAS 3x3 (verified against runs clsxmzpk and gqr78zjr, whose
-    Num Params differ by 30 = 2 extra SU(4) gates).
-
-    So panel b honestly shows the nearest-neighbor circuit that is actually built -- and it is NOT
-    grid adjacency: 2 of its 6 added edges, (2,3) and (5,6), join grid pixels that aren't neighbours,
-    because setup's nearest_neighbor branch never maps its pixel pairs through init_qubit_order_bas.
-    Making that panel look like a grid requires fixing setup.setup_circuit_extensions, not this
-    figure."""
+    _to_labels -- whatever setup hands to extend_circuit is a list of QUBIT pairs. Relabelling chain
+    and extension together is a bijection, so each panel's NEW-edge count is exactly the "New
+    connections" its run logs: 4 metric-based / 5 Chow-Liu / 28 all-to-all for BAS 3x3 (verified
+    against run gqr78zjr)."""
     dataset = cfg.data.dataset
     n_qubits = cfg.data.N_qubits
     labels = _node_labels(cfg)
@@ -362,22 +390,12 @@ def plot_topology_panel(cfg, X_train: np.ndarray, distmat: np.ndarray, threshold
     edges_metric = _to_labels(metric_based_topology(distmat, threshold), labels)
     edges_tree = _to_labels(chow_liu_topology(mutual_info_matrix(np.asarray(X_train))), labels)
 
-    if dataset == "BAS":
-        width, height = cfg.data.width, cfg.data.height
-        panels = {
-            "a) Linear": edges_lin,
-            "b) Nearest-Neighbor": _to_labels(nearest_neighbor_topology(width, height), labels),
-            f"c) Metric-Based ({rule}={threshold:.2f})": edges_metric,
-            "d) Chow-Liu": edges_tree,
-            "e) All-to-All": all_to_all_topology(n_qubits),
-        }
-    else:
-        panels = {
-            "a) Linear": edges_lin,
-            f"b) Metric-Based ({rule}={threshold:.2f})": edges_metric,
-            "c) Chow-Liu": edges_tree,
-            "d) All-to-All": all_to_all_topology(n_qubits),
-        }
+    panels = {
+        "a) Linear": edges_lin,
+        f"b) Metric-Based ({rule}={threshold:.2f})": edges_metric,
+        "c) Chow-Liu": edges_tree,
+        "d) All-to-All": all_to_all_topology(n_qubits),
+    }
 
     fig, axs = plt.subplots(1, len(panels), figsize=(3 * len(panels), 3))
     for ax, (name, edges) in zip(np.atleast_1d(axs), panels.items()):
@@ -405,7 +423,8 @@ def _connection_levels(thresholds: np.ndarray, counts: np.ndarray) -> list:
 # per-dataset driver
 # --------------------------------------------------------------------------------------------------
 def generate_extension_figures(cfg, plots_dir: str = "plots") -> float:
-    """Generate every dataset-only figure for one dataset config: preprocessing, threshold curve,
+    """Generate every dataset-only figure for one dataset config: preprocessing, threshold curves
+    (both the full comparison-across-metrics-and-rules figure and the selected-only companion),
     extension heatmap, and topology networks, all sharing one auto-selected threshold (rule per
     cfg.circuit.threshold_rule). Returns the selected threshold."""
     dataset = cfg.data.dataset
@@ -457,6 +476,8 @@ def generate_extension_figures(cfg, plots_dir: str = "plots") -> float:
 
     plot_threshold_curve(curves, selected_rule=rule, selected_metric=cfg.circuit.extension_metric,
                         plots_dir=folder)
+    plot_selected_threshold_curve(curves, selected_rule=rule, selected_metric=cfg.circuit.extension_metric,
+                                  plots_dir=folder)
     plot_extension_heatmap(distmat, threshold, rule=rule, plots_dir=folder,
                            metric_label=_METRIC_LABELS[cfg.circuit.extension_metric])
     plot_topology_panel(cfg, X_train, distmat, threshold, rule=rule, plots_dir=folder)

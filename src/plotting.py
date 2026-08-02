@@ -11,11 +11,16 @@ change, not on every call here.
 
 Typical use:
     from src.plotting import generate_all_figures
-    generate_all_figures(sweep_id="<sweep>", entity="<you>", project="qcbm-circuit-design",
-                         dataset_cfg={"dataset": "BAS"})
+    generate_all_figures(sweep_id="<sweep>", entity="<you>", project="qcbm-circuit-design")
+
+The dataset a sweep was trained on is read off the runs' own logged configs (see detect_dataset), not
+passed in -- it decides the output directory name and which dataset-specific figures are generated,
+and getting it from the caller meant a default could silently mislabel a whole figure set.
 """
 
 import os
+from collections import namedtuple
+
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -43,12 +48,18 @@ def use_science_style():
 _EXTENSION_LABELS = {
     "none": "linear",
     "linear": "linear",
-    "nearest_neighbor": "nearest-neighbor",
     "random": "random",
     "metric_based": "metric-based",
     "chow_liu": "chow-liu",
     "all_to_all": "all-to-all",
+    "nearest_neighbor": "nearest-neighbor",   # in EXCLUDED_EXTENSIONS, so normally never plotted
 }
+
+# extensions kept out of EVERY figure: fetch_runs drops their runs, so no curve, benchmark row, table
+# or QQ panel is ever built for them, and src.plot_extension omits their topology panel. This is a
+# PLOTTING decision only -- src.extension/src.setup still implement them and a run can still be
+# configured with one; it simply won't be shown.
+EXCLUDED_EXTENSIONS = {"nearest_neighbor"}
 
 # Okabe & Ito (2008) colorblind-safe palette -- the de facto standard for categorical color in
 # scientific publishing (Wong, "Points of view: Color blindness", Nature Methods 8, 441, 2011).
@@ -63,17 +74,24 @@ OKABE_ITO = {
     "reddish_purple": "#CC79A7",
 }
 
-# fixed roles for the recurring extension categories, so their color stays constant across figures
-# regardless of which/how-many other keys are present
+# One fixed color per extension, keyed on the canonical label (_EXTENSION_LABELS), so an extension
+# keeps its color in EVERY figure -- across sweeps, and regardless of which/how-many other extensions
+# are present. This has to be exhaustive over the extensions, not just a couple of them: the fallback
+# below assigns by position, so with only some extensions pinned, a sweep missing one group (or a
+# wandb run list in a different order) silently shifted every unpinned extension's color, and the same
+# extension then appeared in different colors in two figures of the same paper.
 _ROLE_COLORS = {
-    "metric-based": OKABE_ITO["orange"],
+    "linear": OKABE_ITO["blue"],
     "chow-liu": OKABE_ITO["bluish_green"],
+    "metric-based": OKABE_ITO["orange"],
+    "random": OKABE_ITO["vermillion"],
+    "all-to-all": OKABE_ITO["reddish_purple"],
     "nearest-neighbor": OKABE_ITO["sky_blue"],
 }
-# fixed draw order for any remaining (non-role) categorical keys
-_CB_CYCLE = [OKABE_ITO["blue"], OKABE_ITO["vermillion"], OKABE_ITO["reddish_purple"],
-            OKABE_ITO["yellow"], OKABE_ITO["orange"], OKABE_ITO["bluish_green"],
-            OKABE_ITO["sky_blue"]]
+# fallback draw order for categorical keys that are NOT a known extension (e.g. a newly added one, or
+# a sweep grouped by some other config key); ordered so a role color is never handed out twice
+_CB_CYCLE = [OKABE_ITO["sky_blue"], OKABE_ITO["yellow"], OKABE_ITO["blue"], OKABE_ITO["vermillion"],
+            OKABE_ITO["reddish_purple"], OKABE_ITO["orange"], OKABE_ITO["bluish_green"]]
 
 # shared sequential colormap for all continuous/2-D fields (heatmaps, numeric sweeps): cividis is
 # perceptually uniform AND colorblind-safe, so it pairs with the Okabe-Ito categorical palette above.
@@ -90,7 +108,14 @@ def categorical_colors(n: int) -> list:
 
 def default_colors(legend_keys) -> dict:
     """Color map preserving the v1 convention for extensions; Okabe-Ito colorblind-safe categorical
-    palette for named/extra keys, the shared SEQUENTIAL_CMAP (cividis) for numeric sweeps."""
+    palette for named/extra keys, the shared SEQUENTIAL_CMAP (cividis) for numeric sweeps.
+
+    Every known extension gets its pinned _ROLE_COLORS color, so the mapping for a given key does NOT
+    depend on which other keys are present or on the order they arrive in -- two figures of the same
+    sweep, and the same extension across sweeps, are guaranteed the same color. Unknown keys fall back
+    to _CB_CYCLE, assigned in sorted order (again order-independent) and skipping colors a role in this
+    same call already claimed, so the fallback cannot collide with a pinned extension.
+    """
     keys = list(legend_keys)
     # numeric sweep dimension -> sequential colormap ordered by value
     try:
@@ -99,23 +124,26 @@ def default_colors(legend_keys) -> dict:
         return {k: shades[i] for i, k in enumerate(numeric)}
     except (TypeError, ValueError):
         pass
-    colors = {}
-    ci = 0
-    for k in keys:
-        label = _EXTENSION_LABELS.get(k, k)
-        if label in _ROLE_COLORS:
-            colors[k] = _ROLE_COLORS[label]
-        else:
-            colors[k] = _CB_CYCLE[ci % len(_CB_CYCLE)]
-            ci += 1
+    colors = {k: _ROLE_COLORS[_EXTENSION_LABELS.get(k, k)] for k in keys
+              if _EXTENSION_LABELS.get(k, k) in _ROLE_COLORS}
+    taken = set(colors.values())
+    spare = [c for c in _CB_CYCLE if c not in taken] or _CB_CYCLE
+    for i, k in enumerate(sorted((k for k in keys if k not in colors), key=str)):
+        colors[k] = spare[i % len(spare)]
     return colors
 
 
-def _save(fig, plots_dir, filename):
+def _save(fig, plots_dir, filename, extra_artists=None):
+    """`extra_artists` (e.g. a legend added via ax.add_artist rather than ax.legend, so a second
+    legend can coexist on the same axes -- see plot_extension.plot_jgb_raw_data) is passed through as
+    bbox_inches="tight"'s bbox_extra_artists: savefig's tight-bbox pass only auto-discovers the axes'
+    CURRENT legend (ax.legend_), so an orphaned one is otherwise sized without its own extent and gets
+    clipped at the figure edge instead of padded like every other artist."""
     path = f"{plots_dir}/{filename}"
     os.makedirs(os.path.dirname(path), exist_ok=True)  # filename may itself contain "/"
-    fig.savefig(f"{path}.pdf", bbox_inches="tight", transparent=True)
-    fig.savefig(f"{path}.png", bbox_inches="tight", transparent=False, dpi=300)
+    fig.savefig(f"{path}.pdf", bbox_inches="tight", bbox_extra_artists=extra_artists, transparent=True)
+    fig.savefig(f"{path}.png", bbox_inches="tight", bbox_extra_artists=extra_artists, transparent=False,
+               dpi=300)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -135,6 +163,10 @@ def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "circui
 
     Runs whose logged config predates the current schema (e.g. from before a field was renamed or
     regrouped) are skipped with a warning rather than aborting the whole fetch.
+
+    Runs of an EXCLUDED_EXTENSIONS extension are dropped here regardless of `group_by`, so every
+    downstream figure (curves, benchmark tables, the QQ figure -- they all reuse this mapping) omits
+    them.
     """
     runs = []
     for r in bm.sweep_runs(sweep_id, entity, project):
@@ -142,6 +174,12 @@ def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "circui
             runs.append((r, bm.run_config(r)))
         except Exception as e:
             print(f"[plotting]     skipping run {r.id}: config incompatible with current schema ({e})")
+    n_before = len(runs)
+    runs = [(r, cfg) for r, cfg in runs
+            if OmegaConf.select(cfg, "circuit.extension") not in EXCLUDED_EXTENSIONS]
+    if len(runs) < n_before:
+        print(f"[plotting]     excluding {n_before - len(runs)} run(s) of "
+              f"{', '.join(sorted(EXCLUDED_EXTENSIONS))} (not plotted)")
     if filters:
         runs = [(r, cfg) for r, cfg in runs
                 if all(OmegaConf.select(cfg, k) == v for k, v in filters.items())]
@@ -149,6 +187,38 @@ def fetch_runs(sweep_id: str, entity: str, project: str, group_by: str = "circui
     for r, cfg in runs:
         grouped.setdefault(OmegaConf.select(cfg, group_by), []).append(r)
     return grouped
+
+
+def detect_dataset(runs_by_key: dict, expected: str = None) -> str:
+    """The dataset kind ("BAS"/"JGB") a sweep's runs were actually trained on, per their logged config.
+
+    This is the authoritative source for how a figure set is labelled and which dataset-specific
+    figures it gets. The benchmark metrics themselves never depend on it -- each run is scored
+    against its own dataset (see benchmark._evaluate_run) -- so a wrong kind doesn't corrupt any
+    number, it mislabels the output directory and gates the dataset-specific figures (e.g. the JGB QQ
+    grids) on the wrong answer. `expected` is therefore only a cross-check: a disagreement warns and
+    the runs win.
+
+    Raises ValueError if no run config could be read at all (nothing to label the figures from).
+    """
+    kinds = {}
+    for runs in runs_by_key.values():
+        for r in runs:
+            try:
+                kinds.setdefault(bm.run_config(r).data.dataset, []).append(r.id)
+            except Exception:
+                continue  # already reported by fetch_runs
+    if not kinds:
+        raise ValueError("could not read the dataset kind from any run config of this sweep")
+    dataset = max(kinds, key=lambda k: len(kinds[k]))
+    if len(kinds) > 1:
+        counts = ", ".join(f"{k}: {len(v)}" for k, v in sorted(kinds.items()))
+        print(f"[plotting]     WARNING: sweep mixes dataset kinds ({counts}); labelling as the "
+              f"majority kind {dataset}. The metric tables mix both -- plot the sweeps separately.")
+    if expected is not None and expected != dataset:
+        print(f"[plotting]     WARNING: requested dataset {expected} disagrees with the sweep's runs "
+              f"({dataset}); using {dataset}.")
+    return dataset
 
 
 # run.id -> (frozenset of metrics the cached request asked for, raw history dataframe)
@@ -393,8 +463,25 @@ def plot_train_val_mmd(runs_by_key: dict, mode: str = "bootstrap", window: int =
     for ax in axs:
         for handle, label in zip(*ax.get_legend_handles_labels()):
             handles_by_label.setdefault(label, handle)
-    axs[0].legend(handles_by_label.values(), handles_by_label.keys(), loc="best", fontsize=7,
-                 frameon=True)
+    # ordered by parameter count -- the MPS baseline has none of the extension's added SU(4) gates,
+    # so it always leads regardless of count; everything else follows ascending by how many
+    # parameters that extension adds, matching how the benchmark tables are already sorted (see
+    # bootstrap_group_metrics). A group whose runs predate parameter logging (None) sorts last rather
+    # than crashing the comparison.
+    param_count_by_label = {}
+    for key, runs in runs_by_key.items():
+        label = _EXTENSION_LABELS.get(key, str(key))
+        counts = [r.summary.get("train/num_parameters") for r in runs]
+        counts = [c for c in counts if c is not None]
+        if counts and label not in param_count_by_label:
+            param_count_by_label[label] = counts[0]
+    def _legend_key(label):
+        if label == "MPS baseline":
+            return (-1, 0)
+        return (0, param_count_by_label.get(label, np.inf))
+    ordered_labels = sorted(handles_by_label, key=_legend_key)
+    axs[0].legend([handles_by_label[l] for l in ordered_labels], ordered_labels, loc="best",
+                 fontsize=7, frameon=True)
     plt.tight_layout()
     if save:
         _save(fig, plots_dir, filename)
@@ -476,7 +563,7 @@ def save_metric_table(bench_df: pd.DataFrame, plots_dir: str = "plots",
 # setup/cost table has no "best". bench_dist/* is scored against the FULL dataset (train+val+test
 # merged), not per split -- see benchmark.evaluate.
 _LOWER_IS_BETTER = {
-    "best_mmd_val": True,
+    "selection_metric": True,
     "bench_dist/mmd": True,
     "bench_dist/kl": True,
     "bench_dist/tv": True,
@@ -624,51 +711,284 @@ def _render_benchmark_table(bench_df, group_by, columns, show_std, title, filena
     return fig
 
 
-def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
-                 n_shots: int = 10000, n_q: int = 100, plots_dir: str = "plots", save: bool = True,
-                 runs_by_key: dict = None, which: str = "best"):
-    """Per-group QQ plots (model vs data, model vs normal, data vs normal) for JGB best models.
+# Shared data/encoding context for a JGB sweep's QQ figures. Every run of a sweep trains on the same
+# dataset, so the empirical marginals (and the axes they set) are built once from the first run's
+# config; a run whose ENCODING differs would be plotted against a reference it never saw, so callers
+# compare `encoding` and drop mismatches rather than silently rescaling.
+_JGBRef = namedtuple("_JGBRef", "encoding data n_features bits_per_feature quantizer feature_names")
+
+
+def _jgb_reference(cfg) -> _JGBRef:
+    jgb = JGB(cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer)
+    dl = DataLoader(jgb)
+    dl.train_val_test_split(cfg.data.train_split, cfg.data.val_split)
+    return _JGBRef((cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer),
+                   jgb.decimal.values, cfg.data.N_features, jgb.bits_per_feature, dl.quantizer,
+                   list(jgb.raw.columns))  # bond tenors, e.g. "5Y"/"10Y"/"20Y", in feature order
+
+
+def _run_qq_quantiles(run, ref: _JGBRef, n_shots: int, which: str, n_q: int) -> list:
+    """One run's per-feature model quantiles, on the shared data-quantile grid (x is the same for
+    every run and every reference curve, so only the y-values are returned)."""
+    cfg = bm.run_config(run)
+    circuit, params = bm.load_checkpoint(run, which=which)
+    samples = bm.sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
+    feats = bm.reconstruct_features(samples, ref.bits_per_feature, ref.n_features,
+                                    quantizer=ref.quantizer)
+    return [bm.qq_model_vs_data(*feats[i], ref.data[:, i], n_q)[1] for i in range(ref.n_features)]
+
+
+def _group_param_count(runs) -> float:
+    """Parameter count of a group, for the shared legend ordering (ascending in what the extension
+    adds, matching the MMD legends and benchmark tables). A group predating parameter logging sorts
+    last instead of crashing the comparison."""
+    counts = [r.summary.get("train/num_parameters") for r in runs]
+    counts = [c for c in counts if c is not None]
+    return counts[0] if counts else np.inf
+
+
+def _draw_qq_references(ax, ref: _JGBRef, i: int, n_q: int) -> list:
+    """The two reference curves for one panel, on the same lattice and the same estimator as the model
+    curves (see benchmark's QQ reference section): the floor -- the data itself round-tripped through
+    the encoding, so zero model error -- and a Gaussian baseline. Diagonal-to-floor is quantization,
+    floor-to-model is model error. The Gaussian is NOT a floor: a good model can beat it. Returns the
+    plotted arrays so the caller can include them in the panel's axis range."""
+    fdx, fdy = bm.qq_quantized_data_vs_data(ref.quantizer, i, ref.data[:, i], n_q)
+    ax.plot(fdx, fdy, "--", lw=1.1, color=OKABE_ITO["black"], zorder=4, label="quantization floor")
+    gdx, gdy = bm.qq_quantized_gaussian_vs_data(ref.quantizer, i, ref.data[:, i], n_q)
+    ax.plot(gdx, gdy, ":", lw=1.1, color="0.45", zorder=3, label="quantized Gaussian")
+    return [fdx, fdy, gdx, gdy]
+
+
+def _finish_qq_panel(ax, span: list, title: str) -> None:
+    """Square equal-aspect axes spanning every plotted series, plus the y=x guide."""
+    lo = min(float(np.min(a)) for a in span)
+    hi = max(float(np.max(a)) for a in span)
+    pad = 0.03 * (hi - lo)
+    ax.plot([lo, hi], [lo, hi], "-", lw=0.6, color="0.6", zorder=0)
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_aspect("equal")   # a QQ plot is only read against y=x, which must appear at 45 degrees
+    ax.set_title(title)
+    ax.set_xlabel("data quantile")
+
+
+def _qq_legend(fig, axs, save: bool, plots_dir: str, filename: str):
+    """One shared legend below the panels: with a series per group plus the references it no longer
+    fits inside a panel without covering the curves it describes."""
+    handles, labels = axs[0].get_legend_handles_labels()
+    legend = fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.0),
+                        ncol=min(len(labels), 7), fontsize=7, frameon=False)
+    axs[0].set_ylabel("model quantile")
+    plt.tight_layout()
+    if save:
+        _save(fig, plots_dir, filename, extra_artists=(legend,))
+    return legend
+
+
+def plot_qq_vs_data(sweep_id: str, entity: str, project: str, group_by: str = "circuit.extension",
+                    n_shots: int = 10000, n_q: int = 100, plots_dir: str = "plots", save: bool = True,
+                    runs_by_key: dict = None, which: str = "final",
+                    select_metric: str = "train/mmd_train", filename: str = "JGB_QQ"):
+    """One JGB QQ figure comparing EVERY group's model against the data, one panel per feature.
+
+    Every series in a panel is measured against the same reference -- the empirical data quantiles on
+    the x-axis -- so the groups are directly comparable within one panel and the y=x diagonal reads as
+    "matches the data" for all of them. Two references share the panel, both on the same lattice and
+    read off with the same estimator as the models:
+
+      * "quantization floor" -- the data round-tripped through the encoding, i.e. a perfect model
+        (benchmark.qq_quantized_data_vs_data). Diagonal-to-floor is what the encoding costs;
+        floor-to-model is that model's own error. No model curve can beat it.
+      * "quantized Gaussian" -- a Gaussian fitted to the quantized data, placed analytically on the
+        same lattice (benchmark.qq_quantized_gaussian_vs_data). A parametric BASELINE, not a floor:
+        its offset also contains the Gaussian's misfit of the data, so a good model can and does beat
+        it on heavy-tailed features.
+
+    This replaces a per-model figure carrying model-vs-data, model-vs-normal and data-vs-normal
+    curves. Both dropped series compared each model to a DIFFERENT reference -- a Gaussian fitted to
+    that model's own marginal -- so they measured Gaussian-ness of the model rather than agreement
+    with the data, and could not be read across models. Per-model deviation from the data is now
+    read off one panel instead of flipping between figures.
+
+    One model per group, sampled with `n_shots`: the run whose FINAL-iteration `select_metric` is
+    lowest (benchmark.select_best_run reads the wandb summary, which holds each metric's last-logged
+    value unless explicitly overridden), with `which="final"` to match so the checkpoint plotted is
+    the one that value was measured on.
+
+    Note `select_metric="train/mmd_train"` is the final iteration's TRAINING MMD, not the "best_mmd_val"
+    summary key (the val-selected checkpoint, which for this pipeline lands at initialization for most
+    runs -- best_iter == 1 for 63 of 80 on the sweep this was built against -- and so reports a
+    near-untrained model). Final-iteration validation is the other leak-free option but barely
+    discriminates here (~1.03x between group medians against ~1.13x scatter between seeds of one
+    group); training MMD separates by ~10x with tight within-group ranges, which is why it is the
+    default. train/mmd_test must never be used: selecting a run by it leaks the split the figure is
+    then read against.
+
+    The trade-off: ranking seeds by training fit prefers whichever seed fit the training sample
+    hardest, so this picks a REPRESENTATIVE model for judging marginal shape and is not evidence of
+    generalization. The bench_dist/* tables, bootstrapped over all seeds, remain the quantitative
+    claim. The across-seed spread is NOT drawn here.
 
     `runs_by_key` optionally supplies the already-fetched {group_key: [runs]} mapping; without it the
     grouping is (re)built from the cached sweep run list. `which` selects "best" or "final" (see
-    benchmark.load_checkpoint).
+    benchmark.load_checkpoint). Returns the figure, or None if no group had a usable JGB checkpoint.
     """
     grouped = runs_by_key if runs_by_key is not None else fetch_runs(sweep_id, entity, project, group_by)
-    figs = {}
+    colors = default_colors(list(grouped))
+    # the panels can only be built once the shared data axis is known, so sampling comes first
+    series, ref = [], None
     for key, runs in grouped.items():
-        best = bm.select_best_run(runs)
+        best = bm.select_best_run(runs, metric=select_metric)
         if best is None:
             continue
         cfg = bm.run_config(best)
         if cfg.data.dataset != "JGB":
             continue
-        print(f"[plotting]     [{key}] QQ plots from best run {best.id}...")
-        circuit, params = bm.load_checkpoint(best, which=which)
-        samples = bm.sample_model(circuit, params, n_shots, seed=cfg.sweep.random_seed)
-        jgb = JGB(cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer); dl = DataLoader(jgb)
-        dl.train_val_test_split(cfg.data.train_split, cfg.data.val_split)
-        bpf = jgb.bits_per_feature
-        feats = bm.reconstruct_features(samples, bpf, cfg.data.N_features, quantizer=dl.quantizer)
-        data = jgb.decimal.values
-        fig, axs = plt.subplots(1, cfg.data.N_features, figsize=(3 * cfg.data.N_features, 3))
-        for i, ax in enumerate(np.atleast_1d(axs)):
-            mv, mp = feats[i]
-            dx, my = bm.qq_model_vs_data(mv, mp, data[:, i], n_q)
-            nx_, ny = bm.qq_model_vs_normal(mv, mp, n_q)
-            ndx, ndy = bm.qq_data_vs_normal(data[:, i], n_q)
-            ax.plot(dx, my, ".", ms=3, label="model vs data", color=OKABE_ITO["blue"])
-            ax.plot(nx_, ny, ".", ms=3, label="model vs normal", color=OKABE_ITO["vermillion"])
-            ax.plot(ndx, ndy, ".", ms=3, label="data vs normal", color=OKABE_ITO["bluish_green"])
-            lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
-            ax.plot(lims, lims, "k--", lw=0.6)
-            ax.set_title(f"feature {i}")
-        axs.flatten()[0].legend(fontsize=6) if hasattr(axs, "flatten") else axs.legend(fontsize=6)
-        plt.tight_layout()
-        label = _EXTENSION_LABELS.get(key, str(key)).replace("/", "_")
-        if save:
-            _save(fig, plots_dir, f"JGB_QQ_{label}")
-        figs[key] = fig
-    return figs
+        if ref is None:
+            ref = _jgb_reference(cfg)
+        elif (cfg.data.N_qubits, cfg.data.N_features, cfg.data.quantizer) != ref.encoding:
+            print(f"[plotting]     [{key}] skipped: JGB encoding differs from {ref.encoding}; "
+                  f"not comparable on shared axes.")
+            continue
+        print(f"[plotting]     [{key}] QQ series from run {best.id} "
+              f"({select_metric}={best.summary.get(select_metric)}, which={which})...")
+        series.append((key, _group_param_count(runs),
+                       _run_qq_quantiles(best, ref, n_shots, which, n_q)))
+    if not series:
+        return None
+    series.sort(key=lambda s: s[1])
+
+    fig, axs = plt.subplots(1, ref.n_features, figsize=(3 * ref.n_features, 3), squeeze=False)
+    axs = axs[0]
+    for i, ax in enumerate(axs):
+        dx = np.quantile(ref.data[:, i], np.linspace(0.01, 0.99, n_q))
+        span = [dx]
+        for key, _count, quantiles in series:
+            ax.plot(dx, quantiles[i], "-", lw=1, color=colors[key],
+                    label=_EXTENSION_LABELS.get(key, str(key)))
+            span.append(quantiles[i])
+        span += _draw_qq_references(ax, ref, i, n_q)
+        _finish_qq_panel(ax, span, f"{ref.feature_names[i]} Rate")
+    _qq_legend(fig, axs, save, plots_dir, filename)
+    return fig
+
+
+def plot_qq_bootstrap_vs_data(sweep_id: str, entity: str, project: str,
+                              group_by: str = "circuit.extension", n_shots: int = 10000,
+                              n_q: int = 100, n_boot: int = 1000, plots_dir: str = "plots",
+                              save: bool = True, runs_by_key: dict = None, which: str = "final",
+                              residual_row: bool = True, filename: str = "JGB_QQ_bootstrap"):
+    """The QQ-vs-data figure with EVERY trained model of each group, bootstrapped across seeds.
+
+    Same panels, references and reading as plot_qq_vs_data (one panel per feature, everything measured
+    against the data quantiles on the x-axis, quantization floor + Gaussian baseline drawn the same
+    way), but each group is a band instead of a line: every seed-run's checkpoint is sampled, and at
+    each quantile level the seeds are bootstrapped into a mean +/- across-seed standard error via
+    utils.bootstrap_mean_std -- the same aggregation the MMD curves and benchmark tables already use.
+
+    This removes the single-model figure's selection problem entirely: no seed metric to justify, no
+    leakage question, and no dependence on a ranking that (for validation) is mostly noise. It also
+    answers what one model cannot -- whether a group's departure from the quantization floor is
+    resolved above seed-to-seed scatter, i.e. attributable to the extension rather than to the seed.
+
+    `residual_row` adds a second row plotting each band MINUS the quantization floor. On the raw QQ
+    axes both the effect and the band are a few percent of the plotted range -- the across-seed SE
+    lands at ~0.1%, i.e. thinner than the line drawn over it -- so the top row alone cannot show
+    whether bands separate. The residual row rescales the y-axis to the effect itself: zero is the
+    floor (a perfect model), vertical separation between bands is extension-attributable difference,
+    and band thickness is seed noise, read in the same units.
+
+    Two caveats on reading it. The band is POINTWISE at each quantile level, not a simultaneous
+    confidence region for the whole curve. And it covers seed variability only: shot noise is not
+    resampled, being <1% of a bin at these n_shots (see the reference-section note in benchmark).
+
+    Costs one checkpoint load + sampling per RUN rather than per group (~n_runs x the single-model
+    figure), the same work benchmark_all_runs already does in a full pass; artifacts are cached
+    locally, so a repeat pass re-samples but does not re-download. Returns the figure, or None if no
+    group had a usable JGB checkpoint.
+    """
+    grouped = runs_by_key if runs_by_key is not None else fetch_runs(sweep_id, entity, project, group_by)
+    colors = default_colors(list(grouped))
+    # (group_key, param_count, per-feature (mean, se) across seeds); as above, the shared data axis
+    # has to exist before any curve can be placed on it, so all sampling happens first
+    series, ref = [], None
+    for key, runs in grouped.items():
+        cfgs = [(r, bm.run_config(r)) for r in runs]
+        cfgs = [(r, c) for r, c in cfgs if c.data.dataset == "JGB"]
+        if not cfgs:
+            continue
+        if ref is None:
+            ref = _jgb_reference(cfgs[0][1])
+        cfgs = [(r, c) for r, c in cfgs
+                if (c.data.N_qubits, c.data.N_features, c.data.quantizer) == ref.encoding]
+        if not cfgs:
+            print(f"[plotting]     [{key}] skipped: JGB encoding differs from {ref.encoding}; "
+                  f"not comparable on shared axes.")
+            continue
+        print(f"[plotting]     [{key}] QQ band from {len(cfgs)} run(s) (which={which})...")
+        per_run = []
+        for run, _cfg in cfgs:
+            try:
+                per_run.append(_run_qq_quantiles(run, ref, n_shots, which, n_q))
+            except Exception as e:   # a run whose artifact/checkpoint is unusable must not sink the group
+                print(f"[plotting]         skipping run {run.id}: {e!r}")
+        if not per_run:
+            print(f"[plotting]     [{key}] no usable checkpoint, skipping group.")
+            continue
+        # (n_runs, n_q) per feature -> pointwise bootstrap mean and across-seed SE
+        bands = []
+        for i in range(ref.n_features):
+            stacked = np.array([curves[i] for curves in per_run], dtype=float)
+            bands.append(bootstrap_mean_std(stacked, n_boot=n_boot, seed=0))
+        series.append((key, _group_param_count(runs), bands, len(per_run)))
+    if not series:
+        return None
+    series.sort(key=lambda s: s[1])
+    print(f"[plotting]     bootstrapping {n_boot} resamples per quantile from "
+          f"{', '.join(f'{k}: {n}' for k, _c, _b, n in series)} run(s)")
+
+    n_rows = 2 if residual_row else 1
+    # the residual row is not equal-aspect (its y is a difference, not a quantile) so it needs less
+    # height than the square QQ panels above it
+    fig, grid = plt.subplots(n_rows, ref.n_features, squeeze=False,
+                             figsize=(3 * ref.n_features, 3 + 2.1 * (n_rows - 1)),
+                             gridspec_kw={"height_ratios": [3, 2][:n_rows]})
+    axs = grid[0]
+    for i, ax in enumerate(axs):
+        dx = np.quantile(ref.data[:, i], np.linspace(0.01, 0.99, n_q))
+        span = [dx]
+        for key, _count, bands, _n in series:
+            mean, se = bands[i]
+            ax.fill_between(dx, mean - se, mean + se, color=colors[key], alpha=0.25, lw=0, zorder=2)
+            ax.plot(dx, mean, "-", lw=1, color=colors[key], zorder=2,
+                    label=_EXTENSION_LABELS.get(key, str(key)))
+            span += [mean - se, mean + se]
+        span += _draw_qq_references(ax, ref, i, n_q)
+        _finish_qq_panel(ax, span, f"{ref.feature_names[i]} Rate")
+        if not residual_row:
+            continue
+        # same series, floor subtracted: zero is a perfect model, so vertical gaps between bands are
+        # extension-attributable and band thickness is seed noise -- both in the same units, on a
+        # y-axis scaled to the effect rather than to the quantile range
+        rax = grid[1][i]
+        _, floor = bm.qq_quantized_data_vs_data(ref.quantizer, i, ref.data[:, i], n_q)
+        for key, _count, bands, _n in series:
+            mean, se = bands[i]
+            rax.fill_between(dx, mean - se - floor, mean + se - floor, color=colors[key],
+                             alpha=0.25, lw=0, zorder=2)
+            rax.plot(dx, mean - floor, "-", lw=1, color=colors[key], zorder=2)
+        _, gauss = bm.qq_quantized_gaussian_vs_data(ref.quantizer, i, ref.data[:, i], n_q)
+        rax.plot(dx, gauss - floor, ":", lw=1.1, color="0.45", zorder=3)
+        rax.axhline(0.0, ls="--", lw=1.1, color=OKABE_ITO["black"], zorder=4)
+        rax.set_xlim(*ax.get_xlim())
+        rax.set_xlabel("data quantile")
+    if residual_row:
+        grid[1][0].set_ylabel("model $-$ floor")
+        for ax in axs:      # the shared x-axis is labelled on the residual row instead
+            ax.set_xlabel("")
+    _qq_legend(fig, axs, save, plots_dir, filename)
+    return fig
 
 
 # --------------------------------------------------------------------------------------------------
@@ -679,7 +999,7 @@ def plot_qq_grid(sweep_id: str, entity: str, project: str, group_by: str = "circ
 # the order the figures are generated in; anything present in bench_df but missing here still gets a
 # figure, labelled with its raw column name.
 _BENCH_METRIC_LABELS = {
-    "best_mmd_val": "best validation MMD",
+    "selection_metric": "seed-selection metric (see benchmark.select_best_run)",
     "bench_dist/mmd": "MMD (full dataset)",
     "bench_dist/kl": "KL divergence (full dataset)",
     "bench_dist/tv": "total variation (full dataset)",
@@ -704,20 +1024,26 @@ _BENCH_METRIC_LABELS = {
 # the largest is all-to-all-equivalent -- so neighbouring points can be the same circuit.
 # {threshold value: (legend label, colour, marker)}
 _THRESHOLD_ENDPOINTS = {
-    0.0: ("linear (threshold = 0)", OKABE_ITO["reddish_purple"], "s"),
-    1.0: ("all-to-all (threshold = 1)", OKABE_ITO["bluish_green"], "D"),
+    0.0: ("linear @ 0.000", OKABE_ITO["reddish_purple"], "s"),
+    1.0: ("all-to-all @ 1.000", OKABE_ITO["bluish_green"], "D"),
 }
 
 
+_THRESHOLD_RULE_COLORS = {"knee": OKABE_ITO["vermillion"], "percolation": OKABE_ITO["orange"]}
+
+
 def _threshold_reference_values(any_run) -> list:
-    """The (rule, threshold, colour) references to mark on a threshold-sweep figure.
+    """The single (rule, threshold, colour) reference to mark on a threshold-sweep figure: whichever
+    rule cfg.circuit.threshold_rule selects for that run, NOT both knee and percolation -- a
+    threshold-sweep run picks one rule to auto-select against (see setup._metric_based_connections),
+    so only that rule's value is a real reference point for the sweep; the other rule was never used.
 
     Computed from ONE run's dataset/extension_metric -- constant across a threshold sweep, where only
-    circuit.threshold varies between groups -- via the same helpers setup uses, so the marked values
-    are the ones the auto-selecting rules would actually have picked.
+    circuit.threshold varies between groups -- via the same helpers setup uses, so the marked value is
+    the one the run's auto-selecting rule would actually have picked.
 
-    These lines are an annotation, not the data: a config whose dataset can't be reconstructed yields
-    an empty list (with a warning) so the metric figures are still produced, unmarked, rather than the
+    This line is an annotation, not the data: a config whose dataset can't be reconstructed yields an
+    empty list (with a warning) so the metric figures are still produced, unmarked, rather than the
     whole sweep failing over a reference value.
     """
     from src.setup import setup_dataloader, compute_split
@@ -726,28 +1052,30 @@ def _threshold_reference_values(any_run) -> list:
 
     try:
         cfg = bm.run_config(any_run)
+        rule = cfg.circuit.threshold_rule
         X_train, *_ = compute_split(cfg, setup_dataloader(cfg))
         distmat = feature_distance_matrix(X_train, cfg.circuit.extension_metric)
-        return [("knee", knee_threshold(distmat), OKABE_ITO["vermillion"]),
-                ("percolation", percolation_threshold(distmat), OKABE_ITO["orange"])]
+        value = knee_threshold(distmat) if rule == "knee" else percolation_threshold(distmat)
+        return [(rule, value, _THRESHOLD_RULE_COLORS[rule])]
     except Exception as e:
-        print(f"[plotting]     no knee/percolation reference lines: {e!r}")
+        print(f"[plotting]     no threshold-rule reference line: {e!r}")
         return []
 
 
 def plot_metrics_vs_threshold(sweep_id: str, entity: str, project: str,
                               group_by: str = "circuit.threshold", n_shots: int = 10000,
-                              n_boot: int = 1000, which: str = "best", metrics=None,
+                              n_boot: int = 1000, which: str = "final", metrics=None,
                               plots_dir: str = "plots", save: bool = True) -> tuple:
     """One figure per benchmark metric vs. the metric_based threshold, for a sweep where
     `circuit.threshold` (not circuit.extension) was the swept dimension -- e.g. to see how an
     auto-selected knee/percolation threshold compares to a hand-swept range.
 
     Every metric in the benchmark suite that bench_df carries gets its own figure (mean +/- bootstrap
-    SE per threshold, with both reference thresholds marked); `metrics` restricts that set. The sweep
-    is fetched, benchmarked and bootstrapped ONCE and the reference thresholds computed once, then
-    reused for every figure. Metrics that are absent or all-NaN are skipped (e.g. bench_BAS/* on a JGB
-    sweep, bench_val/* on a BAS full_support sweep).
+    SE per threshold, with the config-selected threshold_rule's value marked -- see
+    _threshold_reference_values); `metrics` restricts that set. The sweep is fetched, benchmarked and
+    bootstrapped ONCE and the reference value computed once, then reused for every figure. Metrics
+    that are absent or all-NaN are skipped (e.g. bench_BAS/* on a JGB sweep, bench_val/* on a BAS
+    full_support sweep).
 
     Not part of generate_all_figures -- that pipeline assumes circuit.extension grouping. Saves to
     plots_dir/<sweep_id>-threshold/, mirroring generate_all_figures' <sweep_id>-<dataset> convention.
@@ -824,18 +1152,29 @@ def _render_metric_vs_threshold(bench_df, group_by, metric, references, plots_di
     if not main.empty:
         ax.errorbar(main[group_by], main[metric], yerr=_errs(main), fmt="o", ms=4, ls="none",
                    capsize=2, color=OKABE_ITO["blue"], elinewidth=0.8)
+    # collected as (threshold value, handle) so the legend below can be ordered by threshold --
+    # linear (0.0) first, metric-based (the auto-selected reference value) in the middle, all-to-all
+    # (1.0) last -- regardless of the order these artists were drawn in
+    legend_entries = []
     for value, (label, color, marker) in _THRESHOLD_ENDPOINTS.items():
         row = ends[np.isclose(ends[group_by], value)]
         if row.empty:
             continue
-        ax.errorbar(row[group_by], row[metric], yerr=_errs(row), fmt=marker, ms=5, ls="none",
-                   capsize=2, color=color, elinewidth=0.8, label=label, zorder=4)
+        handle = ax.errorbar(row[group_by], row[metric], yerr=_errs(row), fmt=marker, ms=5, ls="none",
+                            capsize=2, color=color, elinewidth=0.8, label=label, zorder=4)
+        legend_entries.append((value, handle))
     for rule, value, color in references:
-        ax.axvline(value, color=color, ls="--", lw=1, label=f"{rule} @ {value:.3f}")
+        # the rule (knee/percolation) is an implementation detail of HOW the threshold was
+        # auto-selected; the line marks the metric-based extension's threshold, so it is labelled
+        # the same way the topology figures name that extension, not by the internal rule name
+        handle = ax.axvline(value, color=color, ls="--", lw=1, label=f"metric-based @ {value:.3f}")
+        legend_entries.append((value, handle))
+    if legend_entries:
+        legend_entries.sort(key=lambda e: e[0])
+        ax.legend([h for _, h in legend_entries], [h.get_label() for _, h in legend_entries],
+                 fontsize=7, frameon=True)
     ax.set_xlabel("threshold")
     ax.set_ylabel(_BENCH_METRIC_LABELS.get(metric, metric))
-    if ax.get_legend_handles_labels()[0]:  # endpoints and/or reference lines
-        ax.legend(fontsize=7, frameon=True)
     plt.tight_layout()
     if save:
         _save(fig, plots_dir, filename)
@@ -860,22 +1199,28 @@ _MMD_SPLIT_TITLES = {
 }
 
 
-def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: dict,
+def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: dict = None,
                          group_by: str = "circuit.extension",
                          metrics=("train/mmd_train", "train/mmd_val", "train/mmd_test"),
                          plots_dir: str = "plots", science_style: bool = True, n_boot: int = 1000,
-                         which: str = "best", n_shots: int = 10000):
+                         which: str = "final", n_shots: int = 10000):
     """Generate the training-dependent figure set for a sweep: metric-vs-measurements curves (train
     and val MMD combined into one side-by-side figure, see plot_train_val_mmd) + bootstrap benchmark
-    (metric table, and QQ grids for JGB). Both the curves and the benchmark aggregate ACROSS ALL
+    (metric table, and the per-feature QQ figure for JGB). Both the curves and the benchmark aggregate ACROSS ALL
     SEED-RUNS of each group via bootstrap (mean +/- across-seed standard error); `n_boot` sets the
     number of bootstrap resamples. `which` selects which checkpoint of each run is
-    benchmarked/sampled -- "best" (validation-selected, default) or "final" (see
-    benchmark.load_checkpoint). Saves PDFs to plots_dir/<sweep_id>-<dataset>/, so figures from
-    different sweeps/datasets never collide.
+    benchmarked/sampled and defaults to "final" (last training iteration) rather than "best"
+    (validation-selected) -- the val-selected checkpoint is not usable in this pipeline, where
+    selection on mmd_val fires at initialization for most runs (best_iter == 1; see plot_qq_vs_data).
+    Saves PDFs to plots_dir/<sweep_id>-<dataset>/, so figures from different sweeps/datasets never
+    collide.
+
+    <dataset> is read off the sweep's own run configs (detect_dataset), which also decides whether the
+    JGB-only QQ figure is generated. `dataset_cfg` is optional and only cross-checked against that:
+    passing {"dataset": ...} that disagrees with the runs warns and is ignored.
 
     `n_shots` is how many shots each checkpoint is sampled with for the benchmark suite and the JGB
-    QQ grids. It sets the sampling-noise floor on every reported metric -- the model distribution is
+    QQ figure. It sets the sampling-noise floor on every reported metric -- the model distribution is
     estimated from n_shots draws, so group differences smaller than that noise are not resolvable --
     and it is the dominant cost of a plotting pass (one simulation per run). Raise it when the
     across-seed error bars are small enough that shot noise dominates them.
@@ -887,11 +1232,7 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     varied, see plot_metrics_vs_threshold instead -- a different sweep shape, not generated here."""
     if science_style:
         use_science_style()
-    dataset = dataset_cfg.get("dataset", "BAS")
-    plots_dir = os.path.join(plots_dir, f"{sweep_id}-{dataset}")
-
-    print(f"[plotting] sweep={sweep_id} dataset={dataset} group_by={group_by} which={which} "
-          f"n_shots={n_shots:,} -> {plots_dir}/")
+    print(f"[plotting] sweep={sweep_id} group_by={group_by} which={which} n_shots={n_shots:,}")
 
     # 1) metric-vs-measurements, bootstrapped over all seeds
     #
@@ -903,6 +1244,11 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     n_runs = sum(len(v) for v in grouped.values())
     print(f"[plotting]     found {n_runs} runs across {len(grouped)} group(s): "
           f"{', '.join(str(k) for k in grouped)}")
+    # the run list is also what the dataset label comes from, so the output directory can't disagree
+    # with the sweep it was built from (the run configs are already cached by the fetch above)
+    dataset = detect_dataset(grouped, expected=(dataset_cfg or {}).get("dataset"))
+    plots_dir = os.path.join(plots_dir, f"{sweep_id}-{dataset}")
+    print(f"[plotting]     dataset={dataset} -> {plots_dir}/")
     print(f"[plotting]     fetching histories ({len(metrics)} metric(s), one request per run)...")
     prefetch_histories(grouped, metrics)
     # train/val MMD are combined into one side-by-side figure (plot_train_val_mmd) rather than two
@@ -930,7 +1276,7 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     # 2) benchmark figures: evaluate every run's checkpoint (per `which`), then bootstrap across seeds
     print("[plotting] (2/2) benchmarking all runs per group (bootstrap over seeds)...")
     # `grouped` is passed through so the benchmark reuses the run list fetched above instead of
-    # re-querying the sweep (same for the point-estimate fallback and the QQ grids).
+    # re-querying the sweep (same for the point-estimate fallback and the QQ figure).
     per_run = bm.benchmark_all_runs(sweep_id, entity, project, group_by, n_shots=n_shots,
                                     which=which, groups=grouped)
     bench_df = bootstrap_group_metrics(per_run, group_by=group_by, n_boot=n_boot)
@@ -942,8 +1288,13 @@ def generate_all_figures(sweep_id: str, entity: str, project: str, dataset_cfg: 
     save_metric_table(bench_df, plots_dir=plots_dir)          # full-precision CSV (all columns)
     plot_benchmark_tables(bench_df, group_by=group_by, plots_dir=plots_dir)  # readable per-family cuts
     if dataset == "JGB":
-        plot_qq_grid(sweep_id, entity, project, group_by, n_shots=n_shots, plots_dir=plots_dir,
-                    runs_by_key=grouped, which=which)
+        # both QQ figures: one featured model per group, and the across-seed bootstrap band over all
+        # of them (the latter carries no seed-selection choice -- see plot_qq_bootstrap_vs_data)
+        plot_qq_vs_data(sweep_id, entity, project, group_by, n_shots=n_shots, plots_dir=plots_dir,
+                        runs_by_key=grouped, which=which)
+        plot_qq_bootstrap_vs_data(sweep_id, entity, project, group_by, n_shots=n_shots,
+                                  n_boot=n_boot, plots_dir=plots_dir, runs_by_key=grouped,
+                                  which=which)
     print("[plotting]     done.")
     print(f"[plotting] finished -- figures in {plots_dir}/")
     return bench_df
@@ -964,7 +1315,10 @@ def _parse_args(argv=None):
                              "'Program started (..., sweep_id=...)', or from the Sweeps tab.")
     parser.add_argument("--project", default="qcbm-circuit-design", help="wandb project name.")
     parser.add_argument("--entity", default=None, help="wandb entity (default: your default entity).")
-    parser.add_argument("--dataset", choices=["BAS", "JGB"], default="BAS")
+    parser.add_argument("--dataset", choices=["BAS", "JGB"], default=None,
+                        help="Cross-check only. The dataset is read from the sweep's own run configs "
+                             "(it names the output directory and gates the dataset-specific figures); "
+                             "passing it here just warns if it disagrees with the runs.")
     parser.add_argument("--group-by", default=None,
                         help="Dot-separated config key to use as the plot legend/grouping dimension "
                              "(default: circuit.extension, or circuit.threshold with "
@@ -973,17 +1327,19 @@ def _parse_args(argv=None):
                         default=["train/mmd_train", "train/mmd_val", "train/mmd_test"],
                         help="Logged metrics to plot vs. cumulative measurements.")
     parser.add_argument("--which", choices=["best", "final"], default="final",
-                        help="Which checkpoint to benchmark/sample: best (validation-selected) or "
-                             "final (last training iteration, default).")
+                        help="Which checkpoint to benchmark/sample: final (last training iteration, "
+                             "default) or best (validation-selected -- not meaningful for this "
+                             "pipeline, where mmd_val selection fires at initialization for most "
+                             "runs).")
     parser.add_argument("--threshold-sweep", action="store_true",
                         help="Treat this sweep as a circuit.threshold sweep: plot every benchmark "
-                             "metric vs. threshold (one figure each) with knee/percolation markers, "
-                             "instead of the standard per-extension figure set.")
+                             "metric vs. threshold (one figure each) with the config-selected "
+                             "threshold_rule marked, instead of the standard per-extension figure set.")
     parser.add_argument("--n-boot", type=int, default=1000,
                         help="Bootstrap resamples for the across-seed mean/SE (curves + benchmark).")
     parser.add_argument("--n-shots", type=int, default=10000,
                         help="Shots used to sample each checkpoint for the benchmark metrics (and "
-                             "the JGB QQ grids). Sets the sampling-noise floor on every reported "
+                             "the JGB QQ figure). Sets the sampling-noise floor on every reported "
                              "metric and is the dominant cost of a pass; raise it once the "
                              "across-seed error bars are smaller than the shot noise.")
     parser.add_argument("--plots-dir", default="plots", help="Output directory for the PDFs/PNGs.")
@@ -1009,7 +1365,7 @@ def main(argv=None):
             print(bench_df.to_string(index=False))
         return
 
-    dataset_cfg = {"dataset": args.dataset}
+    dataset_cfg = {"dataset": args.dataset} if args.dataset else None
     bench_df = generate_all_figures(
         sweep_id=args.sweep_id,
         entity=args.entity,
