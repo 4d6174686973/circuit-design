@@ -129,9 +129,9 @@ def plot_bas_images(width=3, height=3, train_split=0.5, val_split=0.25, seed=Non
 
     # wrap into a roughly square grid instead of one long row -- a single row stays readable for a
     # handful of patterns but keeps stretching the figure wider as the enumerated support grows.
-    # BAS 3x3 has few enough patterns (n=6) that a single row is still readable, so keep it flat.
+    # BAS 3x3 (n=14) is laid out as a fixed 2x7 block rather than the generic near-square grid.
     if width == 3 and height == 3:
-        ncols, nrows = n, 1
+        ncols, nrows = 7, 2
     else:
         ncols = int(np.ceil(np.sqrt(n)))
         nrows = int(np.ceil(n / ncols))
