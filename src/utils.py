@@ -297,22 +297,6 @@ def binary_to_real(X_binary, X_min, X_max, bits_per_feature, quantizer: FeatureQ
         quantizer = FeatureQuantizer("minmax", bits_per_feature, X_min, X_max)
     return quantizer.decode(X_binary)
 
-def get_features_for_quasi_dist(samples_dict, bits_per_feature, num_features):
-    sample_gen_arr, sample_gen_probs = sample_info(samples_dict)
-    res_dicts = []
-    for i in range(num_features):
-        f_arr = array_to_str(sample_gen_arr[:,i*bits_per_feature:(i+1)*bits_per_feature]).tolist()
-        f_dict = dict()
-        for j in range(len(f_arr)):
-            if f_arr[j] in f_dict:
-                f_dict[f_arr[j]] += sample_gen_probs[j]
-            else:
-                f_dict[f_arr[j]] = sample_gen_probs[j]
-        assert round(sum([v for v in f_dict.values()]), 12) == 1.0
-        res_dicts.append(f_dict)
-
-    return res_dicts
-
 ### Variation of Information Metric ###
 import numpy as np,scipy.stats as ss
 from scipy.spatial import distance
