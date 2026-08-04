@@ -955,6 +955,16 @@ _GRID_LABEL_SIZE = 9
 _GRID_TICK_SIZE = 8
 _GRID_LEGEND_SIZE = 8
 
+# 2x2 sized for ONE column of a two-column paper: ~3.4in total, so each panel is under 1.7in wide.
+# box_aspect=1 makes the data boxes square, and the type has to come down with them -- at the
+# full-width sizes above, the tick labels of neighbouring panels touch at this width. panel_h is
+# deliberately BELOW the square box height: with box_aspect set, the box is limited by the (narrower)
+# cell width, so any extra height just becomes a gap between the rows.
+# panel_h is tuned so the square boxes come out WIDTH-limited: any more height than the boxes need
+# cannot grow them (fig_width caps that) and just reopens a vertical gap.
+_GRID_ONE_COLUMN = dict(ncols=2, fig_width=3.4, panel_h=1.54, box_aspect=1.0, legend_ncol=3,
+                        fonts={"title": 7, "label": 7, "tick": 6, "legend": 6})
+
 
 def _threshold_reference_value(any_run):
     """The (rule, threshold) to mark on a threshold-sweep figure: whichever value
@@ -1043,14 +1053,19 @@ def plot_metrics_vs_threshold(sweep_id: str, entity: str, project: str,
                                                     plots_dir, filename, save)
     print(f"[plotting]     {len(figs)} metric-vs-threshold figure(s): "
           f"{', '.join(sorted(figs))}")
-    # plus the headline metrics as one combined figure, for including as a single full-width float
-    # instead of a LaTeX subfigure grid that repeats the legend per panel
-    for cols, name in ((2, "metrics_vs_threshold_grid"), (len(grid_metrics), "metrics_vs_threshold_row")):
-        grid = plot_metric_grid_vs_threshold(bench_df, group_by, grid_metrics, reference, ncols=cols,
-                                             plots_dir=plots_dir, save=save, filename=name)
+    # plus the headline metrics as one combined figure, for including as a single float instead of a
+    # LaTeX subfigure grid that repeats the legend per panel. Three sizings, so the same panels can go
+    # in a full-width float or a single column without LaTeX rescaling (and shrinking) the type.
+    for name, kwargs in (
+            ("metrics_vs_threshold_grid", dict(ncols=2)),                       # 2x2, full width
+            ("metrics_vs_threshold_row", dict(ncols=len(grid_metrics))),         # 1xN, full width
+            ("metrics_vs_threshold_column", _GRID_ONE_COLUMN)):                  # 2x2, one column
+        grid = plot_metric_grid_vs_threshold(bench_df, group_by, grid_metrics, reference,
+                                             plots_dir=plots_dir, save=save, filename=name, **kwargs)
         if grid is not None:
             figs[name] = grid
-            print(f"[plotting]     combined {cols}-column figure: {name}")
+            print(f"[plotting]     combined figure: {name} "
+                  f"({grid.get_size_inches()[0]:.2f} x {grid.get_size_inches()[1]:.2f} in)")
     return bench_df, figs
 
 
@@ -1135,7 +1150,8 @@ def _render_metric_vs_threshold(bench_df, group_by, metric, reference, plots_dir
 
 def plot_metric_grid_vs_threshold(bench_df, group_by, metrics, reference, ncols: int = 2,
                                   fig_width: float = _GRID_FIG_W, panel_h: float = _GRID_PANEL_H,
-                                  plots_dir: str = "plots", save: bool = True,
+                                  box_aspect: float = None, legend_ncol: int = None,
+                                  fonts: dict = None, plots_dir: str = "plots", save: bool = True,
                                   filename: str = "metrics_vs_threshold_grid"):
     """Several metric-vs-threshold panels in ONE figure with ONE shared legend.
 
@@ -1148,10 +1164,19 @@ def plot_metric_grid_vs_threshold(bench_df, group_by, metrics, reference, ncols:
     the metric in the title replaces a per-panel y-axis label. `ncols=2` gives a 2x2 block; ncols =
     len(metrics) gives a single flat row, which is much shorter but leaves each panel narrow.
 
-    `fig_width` is the TOTAL width and is what keeps the type readable: the figure is authored at the
-    width it will be included at, so \\includegraphics[width=\\textwidth] neither up- nor down-scales
-    it. Fixing panel width instead would make an n-panel row n times too wide, and LaTeX would then
-    shrink the whole thing -- fonts included -- to fit.
+    `fig_width` is the TOTAL layout width, and setting it (rather than a per-panel width) is what keeps
+    the type readable: authored near the width it will be included at, \\includegraphics barely rescales
+    it, so the fonts land on the page close to their authored size. Fixing panel width instead would
+    make an n-panel row n times too wide and LaTeX would shrink the whole thing, fonts included, to
+    fit. NB _save crops to the ink (bbox_inches="tight"), so the PDF comes out somewhat narrower than
+    `fig_width` and LaTeX scales it up a little -- which errs on the readable side.
+
+    `box_aspect` forces every panel's DATA BOX to that height/width ratio (1.0 = square) via
+    Axes.set_box_aspect, which is what a "square panel" actually means: sizing the subplot cell square
+    instead leaves the box narrower than tall, since the tick labels and title eat into the cell.
+    `panel_h` is then only a starting guess for the figure height -- tight_layout trims to whatever the
+    boxes need. `fonts` overrides the type sizes ({"title","label","tick","legend"}), needed at
+    one-column width where a panel is under 2in wide. `legend_ncol` defaults to one row.
 
     Returns the figure, or None if none of `metrics` is present and non-NaN in bench_df.
     """
@@ -1161,6 +1186,8 @@ def plot_metric_grid_vs_threshold(bench_df, group_by, metrics, reference, ncols:
     metrics = [m for m in metrics if m in bench_df and bench_df[m].notna().any()]
     if not metrics:
         return None
+    sizes = {"title": _GRID_TITLE_SIZE, "label": _GRID_LABEL_SIZE, "tick": _GRID_TICK_SIZE,
+             "legend": _GRID_LEGEND_SIZE, **(fonts or {})}
     ncols = min(ncols, len(metrics))
     nrows = int(np.ceil(len(metrics) / ncols))
     fig, axs = plt.subplots(nrows, ncols, sharex=True, squeeze=False,
@@ -1174,27 +1201,37 @@ def plot_metric_grid_vs_threshold(bench_df, group_by, metrics, reference, ncols:
         for value, handle in _draw_threshold_panel(ax, bench_df, group_by, metric, reference):
             entries.setdefault(handle.get_label(), (value, handle))
         ax.set_title(f"({ascii_lowercase[k]}) {_BENCH_METRIC_LABELS.get(metric, metric)}",
-                     fontsize=_GRID_TITLE_SIZE)
-        ax.tick_params(labelsize=_GRID_TICK_SIZE)
-        # cap the tick count per axis: at ncols=4 a panel is under 2in wide, where the default
-        # 0.0/0.2/../1.0 x ticks and a 4-significant-digit y axis collide with their neighbours
+                     fontsize=sizes["title"])
+        ax.tick_params(labelsize=sizes["tick"])
+        if box_aspect is not None:
+            ax.set_box_aspect(box_aspect)
+        # cap the tick count per axis: at ncols=4, or at one-column width, a panel is under 2in wide,
+        # where the default 0.0/0.2/../1.0 x ticks and a 4-decimal y axis collide with their neighbours
         ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
         # sharex hides tick labels on every row but the last; re-show them on any panel with nothing
         # beneath it, else a partly-filled grid loses its x axis
         if k + ncols >= len(metrics):
-            ax.set_xlabel("Threshold", fontsize=_GRID_LABEL_SIZE)
             ax.tick_params(labelbottom=True)
     for ax in flat[len(metrics):]:
         ax.axis("off")
+    # one centred label for the whole grid: the panels share the axis, so a copy per column only
+    # repeated itself and cost a row of height
+    fig.supxlabel("Threshold", fontsize=sizes["label"])
 
     legend = None
     if entries:
         ordered = sorted(entries.values(), key=lambda e: e[0])
+        # compact handles/spacing so three entries fit one row even at one-column width
         legend = fig.legend([h for _, h in ordered], [h.get_label() for _, h in ordered],
-                            loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=len(ordered),
-                            fontsize=_GRID_LEGEND_SIZE, frameon=False)
-    plt.tight_layout()
+                            loc="upper center", bbox_to_anchor=(0.5, 0.02),
+                            ncol=legend_ncol or len(ordered), fontsize=sizes["legend"],
+                            frameon=False, handlelength=1.4, handletextpad=0.4,
+                            columnspacing=1.0, borderpad=0.2)
+    # w_pad is near zero because total WIDTH is the binding constraint (the figure has to fit a text
+    # column) -- tight_layout already reserves whatever the tick labels measure, so this only trims the
+    # padding on top of that. h_pad just clears the row-2 titles off the row-1 axes.
+    plt.tight_layout(pad=0.25, w_pad=1.8, h_pad=0.9)
     if save:
         _save(fig, plots_dir, filename, extra_artists=(legend,) if legend else None)
     return fig
